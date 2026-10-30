@@ -33,12 +33,12 @@
 
 namespace
 {
-    class ReportSortProxyModel : public QSortFilterProxyModel
+    class HibpReportSortProxyModel : public QSortFilterProxyModel
     {
     public:
-        ReportSortProxyModel(QObject* parent)
+        HibpReportSortProxyModel(QObject* parent)
             : QSortFilterProxyModel(parent){};
-        ~ReportSortProxyModel() override = default;
+        ~HibpReportSortProxyModel() override = default;
 
     protected:
         bool lessThan(const QModelIndex& left, const QModelIndex& right) const override
@@ -58,7 +58,7 @@ ReportsWidgetHibp::ReportsWidgetHibp(QWidget* parent)
     : QWidget(parent)
     , m_ui(new Ui::ReportsWidgetHibp())
     , m_referencesModel(new QStandardItemModel(this))
-    , m_modelProxy(new ReportSortProxyModel(this))
+    , m_modelProxy(new HibpReportSortProxyModel(this))
 {
     m_ui->setupUi(this);
 

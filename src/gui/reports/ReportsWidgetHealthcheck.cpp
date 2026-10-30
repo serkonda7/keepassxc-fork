@@ -76,12 +76,12 @@ namespace
         bool m_anyExcludedEntries = false;
     };
 
-    class ReportSortProxyModel : public QSortFilterProxyModel
+    class HealthcheckReportSortProxyModel : public QSortFilterProxyModel
     {
     public:
-        ReportSortProxyModel(QObject* parent)
+        HealthcheckReportSortProxyModel(QObject* parent)
             : QSortFilterProxyModel(parent){};
-        ~ReportSortProxyModel() override = default;
+        ~HealthcheckReportSortProxyModel() override = default;
 
     protected:
         bool lessThan(const QModelIndex& left, const QModelIndex& right) const override
@@ -140,7 +140,7 @@ ReportsWidgetHealthcheck::ReportsWidgetHealthcheck(QWidget* parent)
     : QWidget(parent)
     , m_ui(new Ui::ReportsWidgetHealthcheck())
     , m_referencesModel(new QStandardItemModel(this))
-    , m_modelProxy(new ReportSortProxyModel(this))
+    , m_modelProxy(new HealthcheckReportSortProxyModel(this))
 {
     m_ui->setupUi(this);
 

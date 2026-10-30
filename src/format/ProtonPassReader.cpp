@@ -36,7 +36,7 @@
 
 namespace
 {
-    Entry* readItem(const QJsonObject& item)
+    Entry* readProtonPassItem(const QJsonObject& item)
     {
         const auto itemMap = item.toVariantMap();
         const auto dataMap = itemMap.value("data").toMap();
@@ -179,7 +179,7 @@ namespace
         return entry.take();
     }
 
-    void writeVaultToDatabase(const QJsonObject& vault, QSharedPointer<Database> db)
+    void writeProtonPassVaultToDatabase(const QJsonObject& vault, QSharedPointer<Database> db)
     {
         // Create groups from vaults and store a temporary map of id -> uuid
         const auto vaults = vault.value("vaults").toObject().toVariantMap();
@@ -193,7 +193,7 @@ namespace
 
             const auto items = vaultObj.value("items").toArray();
             for (const auto& item : items) {
-                auto entry = readItem(item.toObject());
+                auto entry = readProtonPassItem(item.toObject());
                 if (entry) {
                     entry->setGroup(group, false);
                 }
@@ -247,7 +247,7 @@ QSharedPointer<Database> ProtonPassReader::convert(const QString& path)
     auto db = QSharedPointer<Database>::create();
     db->rootGroup()->setName(QObject::tr("Proton Pass Import"));
 
-    writeVaultToDatabase(json, db);
+    writeProtonPassVaultToDatabase(json, db);
 
     return db;
 }

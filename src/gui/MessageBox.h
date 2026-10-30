@@ -22,6 +22,13 @@
 #include <QMap>
 #include <QMessageBox>
 
+// windows.h defines MessageBox as a macro (MessageBoxW/MessageBoxA) which would
+// rename this class. This only surfaces in unity builds, where windows.h may
+// already be included by a preceding translation unit.
+#ifdef MessageBox
+#undef MessageBox
+#endif
+
 class MessageBox
 {
 public:
