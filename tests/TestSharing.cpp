@@ -473,6 +473,89 @@ void TestSharing::testObserverSkipsUnchangedExport()
     }
 }
 
+void TestSharing::testObserverSkipsUnchangedImport()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto db = QSharedPointer<Database>::create();
+    db->setFilePath(directory.filePath("outer.kdbx"));
+
+    auto* shared = new Group();
+    shared->setUuid(QUuid::createUuid());
+    shared->setName("Shared");
+    shared->setParent(db->rootGroup());
+    auto* entry = new Entry();
+    entry->setUuid(QUuid::createUuid());
+    entry->setTitle("Deleted locally");
+    entry->setGroup(shared);
+    const auto deletedUuid = entry->uuid();
+
+    KeeShareSettings::Reference reference;
+    reference.type = KeeShareSettings::SynchronizeWith;
+    reference.password = "share-password";
+    reference.path = "share.kdbx";
+    KeeShare::setReferenceTo(shared, reference);
+    const auto sharePath = directory.filePath(reference.path);
+    const auto shareKey = QSharedPointer<CompositeKey>::create();
+    shareKey->addKey(QSharedPointer<PasswordKey>::create(reference.password));
+
+    KeeShareSettings::Active active;
+    active.in = true;
+    active.out = true;
+    KeeShare::setActive(active);
+    ShareObserver observer(db);
+    emit db->databaseSaved();
+    QVERIFY(QFile::exists(sharePath));
+
+    QStringList messages;
+    connect(&observer, &ShareObserver::sharingMessage, this, [&](const QString& message) { messages << message; });
+    const auto importNow = [&] {
+        QVERIFY(QMetaObject::invokeMethod(&observer, "handleFileUpdated", Q_ARG(QString, sharePath)));
+        QTest::qWait(300);
+    };
+
+    // Delete the entry locally before the next save; merging the unchanged container would resurrect it
+    delete entry;
+    QVERIFY(!shared->findEntryByUuid(deletedUuid));
+
+    // Same bytes
+    importNow();
+    QVERIFY(!shared->findEntryByUuid(deletedUuid));
+    QVERIFY(messages.isEmpty());
+
+    // Same content, new bytes
+    {
+        Database other;
+        QVERIFY(other.open(sharePath, shareKey));
+        QVERIFY(other.saveAs(sharePath));
+    }
+    importNow();
+    QVERIFY(!shared->findEntryByUuid(deletedUuid));
+    QVERIFY(messages.isEmpty());
+
+    // Changed content is merged
+    QUuid addedUuid;
+    {
+        Database other;
+        QVERIFY(other.open(sharePath, shareKey));
+        auto* added = new Entry();
+        added->setUuid(QUuid::createUuid());
+        added->setTitle("Added remotely");
+        added->setGroup(other.rootGroup());
+        addedUuid = added->uuid();
+        QVERIFY(other.saveAs(sharePath));
+    }
+    importNow();
+    QVERIFY(shared->findEntryByUuid(addedUuid));
+    QCOMPARE(messages.size(), 1);
+
+    // The local deletion is still exported
+    emit db->databaseSaved();
+    Database readBack;
+    QVERIFY(readBack.open(sharePath, shareKey));
+    QVERIFY(readBack.rootGroup()->findEntryByUuid(addedUuid));
+}
+
 void TestSharing::testSettingsSerialization()
 {
     QFETCH(bool, importing);

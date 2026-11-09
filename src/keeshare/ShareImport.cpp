@@ -41,6 +41,18 @@ namespace
         unzCloseCurrentFile(uf);
         return data;
     }
+
+    // Deletions are not part of the content fingerprint (the exporting side pushes the deletions of its whole
+    // database, which differ between clients), so a container may only differ by a deletion to apply
+    bool hasApplicableDeletions(const Database* sourceDb, const Group* targetGroup)
+    {
+        for (const auto& object : sourceDb->deletedObjects()) {
+            if (targetGroup->findEntryByUuid(object.uuid) || targetGroup->findGroupByUuid(object.uuid)) {
+                return true;
+            }
+        }
+        return false;
+    }
 } // namespace
 
 ShareObserver::Result ShareImport::containerInto(const QString& resolvedPath,
@@ -48,6 +60,7 @@ ShareObserver::Result ShareImport::containerInto(const QString& resolvedPath,
                                                  Group* targetGroup,
                                                  QByteArray* fingerprint)
 {
+    const QByteArray knownFingerprint = fingerprint ? *fingerprint : QByteArray();
     if (fingerprint) {
         fingerprint->clear();
     }
@@ -90,8 +103,15 @@ ShareObserver::Result ShareImport::containerInto(const QString& resolvedPath,
         return {reference.path, ShareObserver::Result::Error, reader.errorString()};
     }
     sourceDb->setEmitModified(true);
+    const auto contentFingerprint = ShareFingerprint::of(sourceDb->rootGroup(), reference);
     if (fingerprint) {
-        *fingerprint = ShareFingerprint::of(sourceDb->rootGroup(), reference);
+        *fingerprint = contentFingerprint;
+    }
+    if (!knownFingerprint.isEmpty() && knownFingerprint == contentFingerprint
+        && !hasApplicableDeletions(sourceDb.data(), targetGroup)) {
+        // Same content in new bytes (e.g. re-encrypted by another client): already synchronized. Merging again
+        // could at best change nothing and at worst resurrect entries deleted locally since.
+        return {};
     }
 
     qDebug("Synchronize %s %s with %s",

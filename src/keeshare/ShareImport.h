@@ -27,8 +27,10 @@ class ShareImport
 public:
     /**
      * Merge the container at resolvedPath into targetGroup.
-     * If fingerprint is given, it receives the content fingerprint of the container
-     * (see ShareFingerprint) when the container could be read, or is cleared otherwise.
+     * If fingerprint is given and not empty, it is the content fingerprint (see ShareFingerprint) of what
+     * targetGroup last synchronized with this container; if the container holds that same content, the
+     * merge is skipped and an invalid result is returned. On return it receives the content fingerprint of
+     * the container if the container could be read, or is cleared otherwise.
      */
     static ShareObserver::Result containerInto(const QString& resolvedPath,
                                                const KeeShareSettings::Reference& reference,

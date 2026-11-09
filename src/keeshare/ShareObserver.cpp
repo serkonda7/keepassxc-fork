@@ -313,7 +313,13 @@ ShareObserver::Result ShareObserver::importShare(const QString& path)
     // Digest the file before reading it: should it change in between, the digest will not match
     // the recorded content and the next export is not skipped
     const auto digest = fileDigest(resolvedPath);
-    QByteArray fingerprint;
+    const auto state = m_shareStates.value(resolvedPath);
+    if (!digest.isEmpty() && digest == state.fileDigest && !state.fingerprint.isEmpty()) {
+        // The very file we last imported or exported, nothing to read or merge
+        return {};
+    }
+    // Lets the import skip the merge if the content is what we last synchronized
+    QByteArray fingerprint = state.fingerprint;
     const auto result = ShareImport::containerInto(resolvedPath, reference, shareGroup, &fingerprint);
     rememberFingerprint(resolvedPath, fingerprint, digest);
     return result;

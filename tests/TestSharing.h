@@ -43,6 +43,7 @@ private slots:
     void testObserverDeferredImport();
     void testObserverSkipsUnchangedExport();
     void testObserverSkipsUnchangedExport_data();
+    void testObserverSkipsUnchangedImport();
     void testSettingsSerialization();
     void testSettingsSerialization_data();
 
