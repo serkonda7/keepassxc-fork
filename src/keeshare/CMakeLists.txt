@@ -28,4 +28,8 @@ set(keeshare_SOURCES
 
 add_library(keeshare STATIC ${keeshare_SOURCES})
 target_link_libraries(keeshare PUBLIC Qt6::Core Qt6::Widgets ${BOTAN_LIBRARIES} ${ZLIB_LIBRARIES} PRIVATE ${MINIZIP_LIBRARIES})
+# keeshare contains GUI widgets that use symbols from keepassxc_gui, while keepassxc_gui links keeshare.
+# Declare the cycle explicitly so CMake repeats the static libraries on the link line (needed for
+# targets that only pull in a subset of keeshare, e.g. unit tests).
+target_link_libraries(keeshare PRIVATE keepassxc_gui)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})

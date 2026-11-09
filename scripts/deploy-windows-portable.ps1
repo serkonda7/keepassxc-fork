@@ -114,6 +114,11 @@ if (Test-Path -LiteralPath $sourceWordlists) {
     Copy-Item -LiteralPath $sourceWordlists -Destination $shareOut -Recurse -Force
 }
 
+$sourceIcons = Join-Path $SourceDir 'share\icons'
+if (Test-Path -LiteralPath $sourceIcons) {
+    Copy-Item -LiteralPath $sourceIcons -Destination $shareOut -Recurse -Force
+}
+
 # Sanity check: direct deps of main exe should resolve to dist or system dirs.
 if (Test-Path -LiteralPath $mainExe) {
     $missing = @()

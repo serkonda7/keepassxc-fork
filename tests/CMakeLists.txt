@@ -63,10 +63,10 @@ add_unit_test(NAME testgroup SOURCES TestGroup.cpp
 add_unit_test(NAME testkdbx2 SOURCES TestKdbx2.cpp
         LIBS ${TEST_LIBRARIES})
 
-add_unit_test(NAME testkdbx3 SOURCES TestKeePass2Format.cpp FailDevice.cpp mock/MockChallengeResponseKey.cpp TestKdbx3.cpp
+add_unit_test(NAME testkdbx3 SOURCES TestKeePass2Format.cpp mock/MockChallengeResponseKey.cpp TestKdbx3.cpp
         LIBS testsupport ${TEST_LIBRARIES})
 
-add_unit_test(NAME testkdbx4 SOURCES TestKeePass2Format.cpp FailDevice.cpp mock/MockChallengeResponseKey.cpp TestKdbx4.cpp
+add_unit_test(NAME testkdbx4 SOURCES TestKeePass2Format.cpp mock/MockChallengeResponseKey.cpp TestKdbx4.cpp
         LIBS testsupport ${TEST_LIBRARIES})
 
 add_unit_test(NAME testkeys SOURCES TestKeys.cpp mock/MockChallengeResponseKey.cpp

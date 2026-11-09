@@ -339,6 +339,7 @@ MainWindow::MainWindow()
     m_ui->actionQuit->setIcon(icons()->icon("application-exit"));
     m_ui->actionDatabaseMerge->setIcon(icons()->icon("database-merge"));
     m_ui->menuRemoteSync->setIcon(icons()->icon("remote-sync"));
+    m_ui->menuRemoteSync->menuAction()->setVisible(false);
     m_ui->actionImport->setIcon(icons()->icon("document-import"));
     m_ui->menuExport->setIcon(icons()->icon("document-export"));
 

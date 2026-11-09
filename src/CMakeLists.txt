@@ -657,7 +657,11 @@ if(WIN32)
         if(TARGET keepassxc-proxy)
             list(APPEND _kpxc_portable_deps keepassxc-proxy)
         endif()
-        add_custom_target(portable
+        # Stamp file keeps the bundle in sync with the executables: the deploy step
+        # only runs when one of the binaries it packages is newer than the stamp.
+        set(_kpxc_portable_stamp "${CMAKE_BINARY_DIR}/src/CMakeFiles/portable.stamp")
+        add_custom_command(
+            OUTPUT "${_kpxc_portable_stamp}"
             COMMAND "${KPXC_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_SOURCE_DIR}/scripts/deploy-windows-portable.ps1"
                 -BuildDir "${CMAKE_BINARY_DIR}"
@@ -666,11 +670,13 @@ if(WIN32)
                 -MinGWBin "${_kpxc_mingw_bin}"
                 -Windeployqt "${DEPLOYQT_EXE}"
                 -Config "$<IF:$<CONFIG:Debug>,Debug,Release>"
+            COMMAND "${CMAKE_COMMAND}" -E touch "${_kpxc_portable_stamp}"
             DEPENDS ${_kpxc_portable_deps}
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
             COMMENT "Creating portable Windows bundle in ${_kpxc_portable_dir}"
             VERBATIM USES_TERMINAL
         )
+        add_custom_target(portable ALL DEPENDS "${_kpxc_portable_stamp}")
     endif()
 
 endif()
