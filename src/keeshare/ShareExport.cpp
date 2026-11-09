@@ -24,6 +24,7 @@
 #include "gui/Icons.h"
 #include "gui/MessageBox.h"
 #include "keeshare/KeeShare.h"
+#include "keeshare/ShareFingerprint.h"
 #include "keys/PasswordKey.h"
 
 #include <../minizip/zip.h>
@@ -37,10 +38,21 @@
 #define zipOpenNewFileInZip64 zipOpenNewFileInZip_64
 #endif
 
+// The export must be deterministic: extracting unchanged content twice has to produce identical
+// timestamps. Otherwise every export looks like a modification to the importing side, which merges
+// it, saves and exports again, and the databases sharing the container never settle. Therefore all
+// objects of the export database are built with timeinfo updates disabled and are never re-enabled
+// (the export database is written once and discarded).
 namespace
 {
     void resolveReferenceAttributes(Entry* targetEntry, const Database* sourceDb)
     {
+        Q_ASSERT(!targetEntry->canUpdateTimeinfo());
+        const auto* sourceReference = sourceDb->rootGroup()->findEntryByUuid(targetEntry->uuid());
+        if (!sourceReference) {
+            return;
+        }
+        auto timeInfo = targetEntry->timeInfo();
         for (const auto& attribute : EntryAttributes::DefaultAttributes) {
             const auto standardValue = targetEntry->attributes()->value(attribute);
             const auto type = EntryPlaceholders::placeholderType(standardValue);
@@ -55,12 +67,18 @@ namespace
             }
             // We could do more sophisticated **** trying to point the reference to the next in-scope reference
             // but those cases with high probability constructed examples and very rare in real usage
-            const auto* sourceReference = sourceDb->rootGroup()->findEntryByUuid(targetEntry->uuid());
             const auto resolvedValue = sourceReference->resolveMultiplePlaceholders(standardValue);
-            targetEntry->beginUpdate();
+            // Resolving is not an edit: no history item and no "now" timestamp. The resolved value changes only
+            // when the referenced entry does, so the exported entry is as recent as the newer of both.
+            // That keeps the export stable while still letting importers pick up a changed referenced value.
+            const auto* referencedEntry = sourceReference->resolveReference(standardValue);
+            if (referencedEntry
+                && referencedEntry->timeInfo().lastModificationTime() > timeInfo.lastModificationTime()) {
+                timeInfo.setLastModificationTime(referencedEntry->timeInfo().lastModificationTime());
+            }
             targetEntry->attributes()->set(attribute, resolvedValue, targetEntry->attributes()->isProtected(attribute));
-            targetEntry->endUpdate();
         }
+        targetEntry->setTimeInfo(timeInfo);
     }
 
     void cloneIcon(Metadata* targetMetadata, const Database* sourceDb, const QUuid& iconUuid)
@@ -74,10 +92,8 @@ namespace
     {
         for (const Entry* sourceEntry : sourceGroup->entries()) {
             auto* targetEntry = sourceEntry->clone(Entry::CloneIncludeHistory);
-            const bool updateTimeinfoEntry = targetEntry->canUpdateTimeinfo();
             targetEntry->setUpdateTimeinfo(false);
             targetEntry->setGroup(targetGroup);
-            targetEntry->setUpdateTimeinfo(updateTimeinfoEntry);
             cloneIcon(targetMetadata, sourceEntry->database(), targetEntry->iconUuid());
         }
     }
@@ -86,10 +102,9 @@ namespace
     {
         for (const Group* sourceGroup : sourceRoot->children()) {
             auto* targetGroup = sourceGroup->clone(Entry::CloneNoFlags, Group::CloneNoFlags);
-            const bool updateTimeinfo = targetGroup->canUpdateTimeinfo();
+            // Stays disabled: adding entries and subgroups below must not stamp the group
             targetGroup->setUpdateTimeinfo(false);
             targetGroup->setParent(targetRoot);
-            targetGroup->setUpdateTimeinfo(updateTimeinfo);
             cloneIcon(targetMetadata, sourceRoot->database(), targetGroup->iconUuid());
             cloneEntries(targetMetadata, sourceGroup, targetGroup);
             cloneChildren(targetMetadata, sourceGroup, targetGroup);
@@ -105,10 +120,8 @@ namespace
 
         // Copy the source root as the root of the export database, memory manage the old root node
         auto* targetRoot = sourceRoot->clone(Entry::CloneNoFlags, Group::CloneNoFlags);
-        const bool updateTimeinfo = targetRoot->canUpdateTimeinfo();
         targetRoot->setUpdateTimeinfo(false);
         KeeShare::setReferenceTo(targetRoot, KeeShareSettings::Reference());
-        targetRoot->setUpdateTimeinfo(updateTimeinfo);
         cloneIcon(targetMetadata, sourceRoot->database(), targetRoot->iconUuid());
         cloneEntries(targetMetadata, sourceRoot, targetRoot);
         if (reference.keepGroups) {
@@ -186,9 +199,16 @@ namespace
 
 ShareObserver::Result ShareExport::intoContainer(const QString& resolvedPath,
                                                  const KeeShareSettings::Reference& reference,
-                                                 const Group* group)
+                                                 const Group* group,
+                                                 QByteArray* fingerprint)
 {
     QScopedPointer<Database> targetDb(extractIntoDatabase(reference, group));
+    // Fingerprint the extracted content so resolved references are covered as they are written
+    const auto contentFingerprint = ShareFingerprint::of(targetDb->rootGroup(), reference);
+    if (fingerprint && !fingerprint->isEmpty() && *fingerprint == contentFingerprint) {
+        // The container already holds this content, writing it again would only trigger other observers
+        return {};
+    }
     if (resolvedPath.endsWith(".kdbx.share")) {
         // Write database to memory and sign it
         QByteArray dbData, signatureData;
@@ -233,5 +253,8 @@ ShareObserver::Result ShareExport::intoContainer(const QString& resolvedPath,
         }
     }
 
+    if (fingerprint) {
+        *fingerprint = contentFingerprint;
+    }
     return {resolvedPath};
 }

@@ -18,6 +18,7 @@
 #ifndef KEEPASSXC_SHAREOBSERVER_H
 #define KEEPASSXC_SHAREOBSERVER_H
 
+#include <QHash>
 #include <QMap>
 #include <QObject>
 #include <QSet>
@@ -81,12 +82,23 @@ private:
     void reinitialize();
     void notifyAbout(const QStringList& success, const QStringList& warning, const QStringList& error);
 
+    QByteArray knownFingerprint(const QString& resolvedPath) const;
+    void rememberFingerprint(const QString& resolvedPath, const QByteArray& fingerprint, const QByteArray& digest);
+
 private:
     QSharedPointer<Database> m_db;
     QMap<QPointer<Group>, KeeShareSettings::Reference> m_groupToReference;
     QMap<QString, QPointer<Group>> m_shareToGroup;
     QMap<QString, QSharedPointer<FileWatcher>> m_fileWatchers;
     QSet<QString> m_pendingImports;
+
+    // Content last imported from or exported to a share file, keyed by resolved path
+    struct ShareState
+    {
+        QByteArray fingerprint; // see ShareFingerprint
+        QByteArray fileDigest; // digest of the file bytes the fingerprint belongs to
+    };
+    QHash<QString, ShareState> m_shareStates;
     bool m_reinitializePending = false;
     bool m_inReinitialize = false;
     bool m_inImport = false;

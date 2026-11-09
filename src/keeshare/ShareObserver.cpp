@@ -18,6 +18,7 @@
 #include "ShareObserver.h"
 #include "core/FileWatcher.h"
 #include "core/Group.h"
+#include "crypto/CryptoHash.h"
 #include "keeshare/KeeShare.h"
 #include "keeshare/ShareExport.h"
 #include "keeshare/ShareImport.h"
@@ -32,6 +33,23 @@ namespace
     {
         const QFileInfo info(database->filePath());
         return info.absoluteDir().absoluteFilePath(path);
+    }
+
+    QByteArray fileDigest(const QString& resolvedPath)
+    {
+        QFile file(resolvedPath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            return {};
+        }
+        CryptoHash hash(CryptoHash::Sha256);
+        while (!file.atEnd()) {
+            const auto data = file.read(64 * 1024);
+            if (data.isEmpty() && file.error() != QFileDevice::NoError) {
+                return {};
+            }
+            hash.addData(data);
+        }
+        return hash.result();
     }
 
     constexpr int FileWatchPeriod = 30;
@@ -73,6 +91,7 @@ void ShareObserver::deinitialize()
     m_groupToReference.clear();
     m_shareToGroup.clear();
     m_fileWatchers.clear();
+    m_shareStates.clear();
 }
 
 void ShareObserver::reinitialize()
@@ -96,6 +115,7 @@ void ShareObserver::reinitialize()
         m_groupToReference.remove(group);
         m_shareToGroup.remove(oldResolvedPath);
         m_fileWatchers.remove(oldResolvedPath);
+        m_shareStates.remove(oldResolvedPath);
 
         if (!newReference.isValid()) {
             continue;
@@ -103,6 +123,7 @@ void ShareObserver::reinitialize()
         m_groupToReference[group] = newReference;
         const auto newResolvedPath = resolvePath(newReference.path, m_db);
         m_shareToGroup[newResolvedPath] = group;
+        m_shareStates.remove(newResolvedPath);
         shares.append({group, newReference});
     }
 
@@ -289,7 +310,37 @@ ShareObserver::Result ShareObserver::importShare(const QString& path)
 
     // Prevent synchronous reentry by database change signals during import.
     QScopedValueRollback importGuard(m_inImport, true);
-    return ShareImport::containerInto(resolvedPath, reference, shareGroup);
+    // Digest the file before reading it: should it change in between, the digest will not match
+    // the recorded content and the next export is not skipped
+    const auto digest = fileDigest(resolvedPath);
+    QByteArray fingerprint;
+    const auto result = ShareImport::containerInto(resolvedPath, reference, shareGroup, &fingerprint);
+    rememberFingerprint(resolvedPath, fingerprint, digest);
+    return result;
+}
+
+QByteArray ShareObserver::knownFingerprint(const QString& resolvedPath) const
+{
+    const auto state = m_shareStates.value(resolvedPath);
+    if (state.fingerprint.isEmpty() || state.fileDigest.isEmpty()) {
+        return {};
+    }
+    // Only trust the fingerprint if nobody modified the file since we last read or wrote it
+    if (fileDigest(resolvedPath) != state.fileDigest) {
+        return {};
+    }
+    return state.fingerprint;
+}
+
+void ShareObserver::rememberFingerprint(const QString& resolvedPath,
+                                        const QByteArray& fingerprint,
+                                        const QByteArray& digest)
+{
+    if (fingerprint.isEmpty() || digest.isEmpty()) {
+        m_shareStates.remove(resolvedPath);
+        return;
+    }
+    m_shareStates.insert(resolvedPath, {fingerprint, digest});
 }
 
 QSharedPointer<Database> ShareObserver::database()
@@ -340,8 +391,15 @@ QList<ShareObserver::Result> ShareObserver::exportShares()
             watcher->stop();
         }
 
+        // Skip the export if the file already holds the shared content: rewriting it would make
+        // every other database synchronizing with it import and export again, endlessly
+        auto fingerprint = knownFingerprint(resolvedPath);
         // TODO: save new path into group settings if not saving to signed container anymore
-        results << ShareExport::intoContainer(resolvedPath, reference.config, reference.group);
+        const auto result = ShareExport::intoContainer(resolvedPath, reference.config, reference.group, &fingerprint);
+        if (result.isValid()) {
+            rememberFingerprint(resolvedPath, result.isError() ? QByteArray() : fingerprint, fileDigest(resolvedPath));
+            results << result;
+        }
 
         if (watcher) {
             watcher->start(resolvedPath, FileWatchPeriod, FileWatchSize);

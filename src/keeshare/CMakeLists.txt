@@ -23,6 +23,7 @@ set(keeshare_SOURCES
     KeeShareSettings.cpp
     ShareImport.cpp
     ShareExport.cpp
+    ShareFingerprint.cpp
     ShareObserver.cpp
     )
 

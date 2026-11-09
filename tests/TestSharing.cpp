@@ -308,6 +308,171 @@ void TestSharing::testObserverDeferredImport()
     QTRY_VERIFY(messages.join('\n').contains("missing.kdbx"));
 }
 
+void TestSharing::testObserverSkipsUnchangedExport_data()
+{
+    QTest::addColumn<bool>("keepGroups");
+    QTest::addColumn<bool>("outOfScopeReference");
+    QTest::newRow("Entries") << false << false;
+    QTest::newRow("Subgroups") << true << false;
+    QTest::newRow("Reference") << false << true;
+}
+
+void TestSharing::testObserverSkipsUnchangedExport()
+{
+    QFETCH(bool, keepGroups);
+    QFETCH(bool, outOfScopeReference);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto db = QSharedPointer<Database>::create();
+    db->setFilePath(directory.filePath("outer.kdbx"));
+
+    auto* shared = new Group();
+    shared->setUuid(QUuid::createUuid());
+    shared->setName("Shared");
+    shared->setParent(db->rootGroup());
+    auto* entry = new Entry();
+    entry->setUuid(QUuid::createUuid());
+    entry->setTitle("Original");
+    entry->setGroup(shared);
+
+    if (keepGroups) {
+        auto* subgroup = new Group();
+        subgroup->setUuid(QUuid::createUuid());
+        subgroup->setName("Subgroup");
+        subgroup->setParent(shared);
+        auto* nested = new Entry();
+        nested->setUuid(QUuid::createUuid());
+        nested->setTitle("Nested");
+        nested->setGroup(subgroup);
+    }
+    Entry* outside = nullptr;
+    Entry* referencing = nullptr;
+    if (outOfScopeReference) {
+        outside = new Entry();
+        outside->setUuid(QUuid::createUuid());
+        outside->setPassword("outside-password");
+        outside->setGroup(db->rootGroup());
+        referencing = new Entry();
+        referencing->setUuid(QUuid::createUuid());
+        referencing->setTitle("Referencing");
+        referencing->setPassword(QString("{REF:P@I:%1}").arg(outside->uuidToHex()));
+        referencing->setGroup(shared);
+    }
+
+    KeeShareSettings::Reference reference;
+    reference.keepGroups = keepGroups;
+    reference.type = KeeShareSettings::SynchronizeWith;
+    reference.password = "share-password";
+    reference.path = "share.kdbx";
+    KeeShare::setReferenceTo(shared, reference);
+    const auto sharePath = directory.filePath(reference.path);
+
+    KeeShareSettings::Active active;
+    active.in = true;
+    active.out = true;
+    KeeShare::setActive(active);
+    ShareObserver observer(db);
+
+    const auto readShare = [&] {
+        QFile file(sharePath);
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+    };
+
+    // First export writes the container
+    emit db->databaseSaved();
+    const auto exported = readShare();
+    QVERIFY(!exported.isEmpty());
+
+    // Nothing changed, the container must not be rewritten (a rewrite has fresh IVs and salts).
+    // Wait so that timestamps stamped during export would differ in their seconds.
+    QTest::qWait(1100);
+    emit db->databaseSaved();
+    QCOMPARE(readShare(), exported);
+
+    // Statistics are not shared content
+    entry->setUpdateTimeinfo(false);
+    TimeInfo timeInfo = entry->timeInfo();
+    timeInfo.setLastAccessTime(timeInfo.lastAccessTime().addSecs(60));
+    timeInfo.setUsageCount(timeInfo.usageCount() + 1);
+    entry->setTimeInfo(timeInfo);
+    entry->setUpdateTimeinfo(true);
+    emit db->databaseSaved();
+    QCOMPARE(readShare(), exported);
+
+    const auto shareKey = QSharedPointer<CompositeKey>::create();
+    shareKey->addKey(QSharedPointer<PasswordKey>::create(reference.password));
+
+    // Another client writes the same content with fresh bytes; after importing it there is nothing to export
+    {
+        Database other;
+        QVERIFY(other.open(sharePath, shareKey));
+        QVERIFY(other.saveAs(sharePath));
+    }
+    const auto rewritten = readShare();
+    QVERIFY(rewritten != exported);
+    QVERIFY(QMetaObject::invokeMethod(&observer, "handleFileUpdated", Q_ARG(QString, sharePath)));
+    QTest::qWait(300);
+    emit db->databaseSaved();
+    QCOMPARE(readShare(), rewritten);
+
+    // Local changes are exported
+    entry->setTitle("Changed");
+    emit db->databaseSaved();
+    const auto changed = readShare();
+    QVERIFY(changed != exported);
+    emit db->databaseSaved();
+    QCOMPARE(readShare(), changed);
+
+    // A container modified behind our back is rewritten even though local content did not change
+    QVERIFY(QFile::remove(sharePath));
+    {
+        QFile file(sharePath);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(exported);
+    }
+    emit db->databaseSaved();
+    QVERIFY(readShare() != exported);
+
+    Database readBack;
+    QVERIFY(readBack.open(sharePath, shareKey));
+    QVERIFY(readBack.rootGroup()->findEntryByUuid(entry->uuid()));
+    QCOMPARE(readBack.rootGroup()->findEntryByUuid(entry->uuid())->title(), QString("Changed"));
+
+    // A deleted container is written again
+    QVERIFY(QFile::remove(sharePath));
+    emit db->databaseSaved();
+    QVERIFY(QFile::exists(sharePath));
+
+    if (outOfScopeReference) {
+        // Resolving the reference is no edit of the referencing entry
+        const auto* resolved = readBack.rootGroup()->findEntryByUuid(referencing->uuid());
+        QVERIFY(resolved);
+        QCOMPARE(resolved->password(), QString("outside-password"));
+        QCOMPARE(resolved->historyItems().size(), referencing->historyItems().size());
+
+        // A change of the referenced entry outside the share is exported and carries its modification time
+        QTest::qWait(1100);
+        outside->setPassword("changed-outside-password");
+        const auto beforeChange = readShare();
+        emit db->databaseSaved();
+        QVERIFY(readShare() != beforeChange);
+        Database updated;
+        QVERIFY(updated.open(sharePath, shareKey));
+        resolved = updated.rootGroup()->findEntryByUuid(referencing->uuid());
+        QVERIFY(resolved);
+        QCOMPARE(resolved->password(), QString("changed-outside-password"));
+        QCOMPARE(resolved->timeInfo().lastModificationTime().toSecsSinceEpoch(),
+                 outside->timeInfo().lastModificationTime().toSecsSinceEpoch());
+        QVERIFY(resolved->timeInfo().lastModificationTime() > referencing->timeInfo().lastModificationTime());
+
+        // ... and is stable afterwards
+        const auto afterChange = readShare();
+        QTest::qWait(1100);
+        emit db->databaseSaved();
+        QCOMPARE(readShare(), afterChange);
+    }
+}
+
 void TestSharing::testSettingsSerialization()
 {
     QFETCH(bool, importing);

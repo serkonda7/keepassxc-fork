@@ -18,6 +18,7 @@
 #include "core/Merger.h"
 #include "format/KeePass2Reader.h"
 #include "keeshare/KeeShare.h"
+#include "keeshare/ShareFingerprint.h"
 #include "keys/PasswordKey.h"
 
 #include <../minizip/unzip.h>
@@ -44,8 +45,12 @@ namespace
 
 ShareObserver::Result ShareImport::containerInto(const QString& resolvedPath,
                                                  const KeeShareSettings::Reference& reference,
-                                                 Group* targetGroup)
+                                                 Group* targetGroup,
+                                                 QByteArray* fingerprint)
 {
+    if (fingerprint) {
+        fingerprint->clear();
+    }
     QByteArray dbData;
 
     auto uf = unzOpen64(resolvedPath.toLatin1().constData());
@@ -85,6 +90,9 @@ ShareObserver::Result ShareImport::containerInto(const QString& resolvedPath,
         return {reference.path, ShareObserver::Result::Error, reader.errorString()};
     }
     sourceDb->setEmitModified(true);
+    if (fingerprint) {
+        *fingerprint = ShareFingerprint::of(sourceDb->rootGroup(), reference);
+    }
 
     qDebug("Synchronize %s %s with %s",
            qPrintable(reference.path),

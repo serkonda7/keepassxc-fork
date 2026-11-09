@@ -27,8 +27,16 @@ class ShareExport
 {
     Q_DECLARE_TR_FUNCTIONS(ShareExport)
 public:
-    static ShareObserver::Result
-    intoContainer(const QString& resolvedPath, const KeeShareSettings::Reference& reference, const Group* group);
+    /**
+     * Export the content of group into the container at resolvedPath.
+     * If fingerprint is given and matches the content fingerprint of the group (see ShareFingerprint),
+     * nothing is written and an invalid result is returned. After a successful export it receives
+     * the fingerprint of the exported content.
+     */
+    static ShareObserver::Result intoContainer(const QString& resolvedPath,
+                                               const KeeShareSettings::Reference& reference,
+                                               const Group* group,
+                                               QByteArray* fingerprint = nullptr);
 
 private:
     ShareExport() = delete;

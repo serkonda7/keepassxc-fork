@@ -41,6 +41,8 @@ private slots:
     void testObserverRejectsInvalidReference();
     void testObserverReinitializeReentry();
     void testObserverDeferredImport();
+    void testObserverSkipsUnchangedExport();
+    void testObserverSkipsUnchangedExport_data();
     void testSettingsSerialization();
     void testSettingsSerialization_data();
 

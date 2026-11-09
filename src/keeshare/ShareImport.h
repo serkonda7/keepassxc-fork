@@ -25,8 +25,15 @@ class ShareImport
 {
     Q_DECLARE_TR_FUNCTIONS(ShareImport)
 public:
-    static ShareObserver::Result
-    containerInto(const QString& resolvedPath, const KeeShareSettings::Reference& reference, Group* targetGroup);
+    /**
+     * Merge the container at resolvedPath into targetGroup.
+     * If fingerprint is given, it receives the content fingerprint of the container
+     * (see ShareFingerprint) when the container could be read, or is cleared otherwise.
+     */
+    static ShareObserver::Result containerInto(const QString& resolvedPath,
+                                               const KeeShareSettings::Reference& reference,
+                                               Group* targetGroup,
+                                               QByteArray* fingerprint = nullptr);
 
 public:
     ShareImport() = delete;
