@@ -36,7 +36,8 @@ namespace ShareFingerprint
      * all subgroups. The properties of the root group itself, entry history, access statistics,
      * sub-second time precision, the order of items and the serialization (random IVs, salts)
      * are ignored, so exported content and the same content read back from the container
-     * produce the same fingerprint.
+     * produce the same fingerprint. Fingerprints depend on the host byte order: compare them only within
+     * the running process, never persist them.
      */
     QByteArray of(const Group* root, const KeeShareSettings::Reference& reference);
 } // namespace ShareFingerprint

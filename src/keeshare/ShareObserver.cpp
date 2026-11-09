@@ -310,17 +310,30 @@ ShareObserver::Result ShareObserver::importShare(const QString& path)
 
     // Prevent synchronous reentry by database change signals during import.
     QScopedValueRollback importGuard(m_inImport, true);
-    // Digest the file before reading it: should it change in between, the digest will not match
-    // the recorded content and the next export is not skipped
-    const auto digest = fileDigest(resolvedPath);
+    // Read the file once: the digest then describes exactly the bytes that are parsed
+    QByteArray containerData;
+    {
+        QFile file(resolvedPath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            qCritical("Unable to open file %s.", qPrintable(reference.path));
+            m_shareStates.remove(resolvedPath);
+            return {reference.path, Result::Error, file.errorString()};
+        }
+        containerData = file.readAll();
+        if (file.error() != QFileDevice::NoError) {
+            m_shareStates.remove(resolvedPath);
+            return {reference.path, Result::Error, file.errorString()};
+        }
+    }
+    const auto digest = CryptoHash::hash(containerData, CryptoHash::Sha256);
     const auto state = m_shareStates.value(resolvedPath);
-    if (!digest.isEmpty() && digest == state.fileDigest && !state.fingerprint.isEmpty()) {
-        // The very file we last imported or exported, nothing to read or merge
+    if (digest == state.fileDigest && !state.fingerprint.isEmpty()) {
+        // The very file we last imported or exported, nothing to parse or merge
         return {};
     }
     // Lets the import skip the merge if the content is what we last synchronized
     QByteArray fingerprint = state.fingerprint;
-    const auto result = ShareImport::containerInto(resolvedPath, reference, shareGroup, &fingerprint);
+    const auto result = ShareImport::containerInto(containerData, reference, shareGroup, &fingerprint);
     rememberFingerprint(resolvedPath, fingerprint, digest);
     return result;
 }

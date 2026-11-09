@@ -44,6 +44,7 @@ private slots:
     void testObserverSkipsUnchangedExport();
     void testObserverSkipsUnchangedExport_data();
     void testObserverSkipsUnchangedImport();
+    void testObserverImportsSignedContainer();
     void testSettingsSerialization();
     void testSettingsSerialization_data();
 

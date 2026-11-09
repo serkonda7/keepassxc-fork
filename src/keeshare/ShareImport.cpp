@@ -23,6 +23,9 @@
 
 #include <../minizip/unzip.h>
 #include <QBuffer>
+#include <QSet>
+
+#include <cstring>
 
 namespace
 {
@@ -42,12 +45,100 @@ namespace
         return data;
     }
 
+    // Read-only minizip stream over a container already in memory, so the file is read only once
+    struct MemoryStream
+    {
+        const QByteArray* data;
+        ZPOS64_T position;
+    };
+
+    voidpf ZCALLBACK memoryOpen(voidpf opaque, const void*, int mode)
+    {
+        if ((mode & ZLIB_FILEFUNC_MODE_READWRITEFILTER) != ZLIB_FILEFUNC_MODE_READ) {
+            return nullptr;
+        }
+        auto* stream = static_cast<MemoryStream*>(opaque);
+        stream->position = 0;
+        return stream;
+    }
+
+    uLong ZCALLBACK memoryRead(voidpf, voidpf handle, void* buffer, uLong size)
+    {
+        auto* stream = static_cast<MemoryStream*>(handle);
+        const auto total = static_cast<ZPOS64_T>(stream->data->size());
+        if (stream->position >= total) {
+            return 0;
+        }
+        const auto count = static_cast<uLong>(qMin<ZPOS64_T>(size, total - stream->position));
+        std::memcpy(buffer, stream->data->constData() + stream->position, count);
+        stream->position += count;
+        return count;
+    }
+
+    uLong ZCALLBACK memoryWrite(voidpf, voidpf, const void*, uLong)
+    {
+        return 0;
+    }
+
+    ZPOS64_T ZCALLBACK memoryTell(voidpf, voidpf handle)
+    {
+        return static_cast<MemoryStream*>(handle)->position;
+    }
+
+    long ZCALLBACK memorySeek(voidpf, voidpf handle, ZPOS64_T offset, int origin)
+    {
+        auto* stream = static_cast<MemoryStream*>(handle);
+        const auto total = static_cast<ZPOS64_T>(stream->data->size());
+        ZPOS64_T base;
+        switch (origin) {
+        case ZLIB_FILEFUNC_SEEK_SET:
+            base = 0;
+            break;
+        case ZLIB_FILEFUNC_SEEK_CUR:
+            base = stream->position;
+            break;
+        case ZLIB_FILEFUNC_SEEK_END:
+            base = total;
+            break;
+        default:
+            return -1;
+        }
+        if (offset > total || base > total - offset) {
+            return -1;
+        }
+        stream->position = base + offset;
+        return 0;
+    }
+
+    int ZCALLBACK memoryClose(voidpf, voidpf)
+    {
+        return 0;
+    }
+
+    int ZCALLBACK memoryError(voidpf, voidpf)
+    {
+        return 0;
+    }
+
     // Deletions are not part of the content fingerprint (the exporting side pushes the deletions of its whole
     // database, which differ between clients), so a container may only differ by a deletion to apply
     bool hasApplicableDeletions(const Database* sourceDb, const Group* targetGroup)
     {
-        for (const auto& object : sourceDb->deletedObjects()) {
-            if (targetGroup->findEntryByUuid(object.uuid) || targetGroup->findGroupByUuid(object.uuid)) {
+        const auto& deletedObjects = sourceDb->deletedObjects();
+        if (deletedObjects.isEmpty()) {
+            return false;
+        }
+        // The deletions span the exporter's whole database and accumulate over its lifetime, so index the
+        // target once instead of searching it for every deletion
+        QSet<QUuid> uuids;
+        for (const auto* group : targetGroup->groupsRecursive(true)) {
+            uuids.insert(group->uuid());
+            for (const auto* entry : group->entries()) {
+                uuids.insert(entry->uuid());
+            }
+        }
+        for (const auto& object : deletedObjects) {
+            if (!object.uuid.isNull() && uuids.contains(object.uuid)) {
                 return true;
             }
         }
@@ -55,7 +146,7 @@ namespace
     }
 } // namespace
 
-ShareObserver::Result ShareImport::containerInto(const QString& resolvedPath,
+ShareObserver::Result ShareImport::containerInto(const QByteArray& containerData,
                                                  const KeeShareSettings::Reference& reference,
                                                  Group* targetGroup,
                                                  QByteArray* fingerprint)
@@ -66,7 +157,18 @@ ShareObserver::Result ShareImport::containerInto(const QString& resolvedPath,
     }
     QByteArray dbData;
 
-    auto uf = unzOpen64(resolvedPath.toLatin1().constData());
+    MemoryStream stream{&containerData, 0};
+    zlib_filefunc64_def memoryFunctions{};
+    memoryFunctions.zopen64_file = memoryOpen;
+    memoryFunctions.zread_file = memoryRead;
+    memoryFunctions.zwrite_file = memoryWrite;
+    memoryFunctions.ztell64_file = memoryTell;
+    memoryFunctions.zseek64_file = memorySeek;
+    memoryFunctions.zclose_file = memoryClose;
+    memoryFunctions.zerror_file = memoryError;
+    memoryFunctions.opaque = &stream;
+
+    auto uf = unzOpen2_64(&stream, &memoryFunctions);
     if (uf) {
         // Open zip share, extract database portion, ignore signature file
         char zipFileName[256];
@@ -80,14 +182,8 @@ ShareObserver::Result ShareImport::containerInto(const QString& resolvedPath,
         }
         unzClose(uf);
     } else {
-        // Open KDBX file directly
-        QFile file(resolvedPath);
-        if (!file.open(QIODevice::ReadOnly)) {
-            qCritical("Unable to open file %s.", qPrintable(reference.path));
-            return {reference.path, ShareObserver::Result::Error, file.errorString()};
-        }
-        dbData = file.readAll();
-        file.close();
+        // Plain KDBX file
+        dbData = containerData;
     }
 
     QBuffer buffer(&dbData);

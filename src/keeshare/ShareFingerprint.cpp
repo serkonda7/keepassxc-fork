@@ -22,12 +22,13 @@
 #include "crypto/CryptoHash.h"
 #include "keeshare/KeeShareSettings.h"
 
-#include <QtEndian>
-
 #include <algorithm>
 
 namespace
 {
+    // Feeds values to the hash without temporary copies: the fingerprint runs on every import and export
+    // and visits every attribute and attachment of the share. Fingerprints are only compared within the
+    // running process, so host byte order and the UTF-16 representation of strings are fine.
     class Hasher
     {
     public:
@@ -38,8 +39,7 @@ namespace
 
         Hasher& operator<<(qint64 value)
         {
-            const auto bigEndian = qToBigEndian(value);
-            m_hash.addData(QByteArray(reinterpret_cast<const char*>(&bigEndian), sizeof(bigEndian)));
+            addRaw(&value, sizeof(value));
             return *this;
         }
 
@@ -63,17 +63,25 @@ namespace
 
         Hasher& operator<<(const char* value)
         {
-            return *this << QByteArray(value);
+            const auto size = qstrlen(value);
+            *this << static_cast<qint64>(size);
+            addRaw(value, size);
+            return *this;
         }
 
         Hasher& operator<<(const QString& value)
         {
-            return *this << value.toUtf8();
+            *this << static_cast<qint64>(value.size());
+            addRaw(value.constData(), value.size() * sizeof(QChar));
+            return *this;
         }
 
         Hasher& operator<<(const QUuid& value)
         {
-            return *this << value.toRfc4122();
+            *this << static_cast<qint64>(value.data1) << static_cast<qint64>(value.data2)
+                  << static_cast<qint64>(value.data3);
+            addRaw(value.data4, sizeof(value.data4));
+            return *this;
         }
 
         Hasher& operator<<(const QDateTime& value)
@@ -88,6 +96,12 @@ namespace
         }
 
     private:
+        void addRaw(const void* data, qsizetype size)
+        {
+            // Wraps the memory without copying; addData consumes it before returning
+            m_hash.addData(QByteArray::fromRawData(static_cast<const char*>(data), size));
+        }
+
         CryptoHash m_hash;
     };
 

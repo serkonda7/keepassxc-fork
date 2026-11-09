@@ -556,6 +556,76 @@ void TestSharing::testObserverSkipsUnchangedImport()
     QVERIFY(readBack.rootGroup()->findEntryByUuid(addedUuid));
 }
 
+void TestSharing::testObserverImportsSignedContainer()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+
+    KeeShareSettings::Active active;
+    active.in = true;
+    active.out = true;
+    KeeShare::setActive(active);
+
+    KeeShareSettings::Reference reference;
+    reference.type = KeeShareSettings::SynchronizeWith;
+    reference.password = "share-password";
+    reference.path = "share.kdbx.share";
+    const auto sharePath = directory.filePath(reference.path);
+
+    // Export a signed container
+    auto source = QSharedPointer<Database>::create();
+    source->setFilePath(directory.filePath("source.kdbx"));
+    auto* sourceShare = new Group();
+    sourceShare->setUuid(QUuid::createUuid());
+    sourceShare->setName("Shared");
+    sourceShare->setParent(source->rootGroup());
+    auto* entry = new Entry();
+    entry->setUuid(QUuid::createUuid());
+    entry->setTitle("Signed");
+    entry->setGroup(sourceShare);
+    KeeShare::setReferenceTo(sourceShare, reference);
+    ShareObserver sourceObserver(source);
+    emit source->databaseSaved();
+    QVERIFY(QFile::exists(sharePath));
+
+    // A second database imports it: the zip is read from memory
+    auto target = QSharedPointer<Database>::create();
+    target->setFilePath(directory.filePath("target.kdbx"));
+    auto* targetShare = new Group();
+    targetShare->setUuid(QUuid::createUuid());
+    targetShare->setName("Imported");
+    targetShare->setParent(target->rootGroup());
+    {
+        reference.type = KeeShareSettings::ImportFrom;
+        KeeShare::setReferenceTo(targetShare, reference);
+        ShareObserver targetObserver(target);
+        QVERIFY(targetShare->findEntryByUuid(entry->uuid()));
+        QCOMPARE(targetShare->findEntryByUuid(entry->uuid())->title(), QString("Signed"));
+    }
+
+    // A truncated container is reported, not read beyond its end
+    QByteArray container;
+    {
+        QFile file(sharePath);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        container = file.readAll();
+    }
+    QStringList messages;
+    for (const auto size : {container.size() / 2, qsizetype(30), qsizetype(4)}) {
+        {
+            QFile file(sharePath);
+            QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            file.write(container.left(size));
+        }
+        ShareObserver observer(target);
+        messages.clear();
+        connect(&observer, &ShareObserver::sharingMessage, this, [&](const QString& message) { messages << message; });
+        QVERIFY(QMetaObject::invokeMethod(&observer, "handleFileUpdated", Q_ARG(QString, sharePath)));
+        QTRY_VERIFY(!messages.isEmpty());
+        QVERIFY(messages.join(QStringLiteral("\n")).contains("failed"));
+    }
+}
+
 void TestSharing::testSettingsSerialization()
 {
     QFETCH(bool, importing);

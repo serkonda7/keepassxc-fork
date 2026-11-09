@@ -26,13 +26,13 @@ class ShareImport
     Q_DECLARE_TR_FUNCTIONS(ShareImport)
 public:
     /**
-     * Merge the container at resolvedPath into targetGroup.
+     * Merge the container (a signed .kdbx.share zip or a plain KDBX file, as read from disk) into targetGroup.
      * If fingerprint is given and not empty, it is the content fingerprint (see ShareFingerprint) of what
      * targetGroup last synchronized with this container; if the container holds that same content, the
      * merge is skipped and an invalid result is returned. On return it receives the content fingerprint of
-     * the container if the container could be read, or is cleared otherwise.
+     * the container if the container could be parsed, or is cleared otherwise.
      */
-    static ShareObserver::Result containerInto(const QString& resolvedPath,
+    static ShareObserver::Result containerInto(const QByteArray& containerData,
                                                const KeeShareSettings::Reference& reference,
                                                Group* targetGroup,
                                                QByteArray* fingerprint = nullptr);
