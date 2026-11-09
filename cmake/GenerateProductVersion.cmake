@@ -64,6 +64,7 @@ function(generate_product_version outfiles)
         VERSION_MAJOR
         VERSION_MINOR
         VERSION_PATCH
+        VERSION_BUILD
         COMPANY_NAME
         COMPANY_COPYRIGHT
         COMMENTS
@@ -84,6 +85,9 @@ function(generate_product_version outfiles)
     endif()
     if (NOT PRODUCT_VERSION_PATCH OR "${PRODUCT_VERSION_PATCH}" STREQUAL "")
         set(PRODUCT_VERSION_PATCH 0)
+    endif()
+    if (NOT PRODUCT_VERSION_BUILD OR "${PRODUCT_VERSION_BUILD}" STREQUAL "")
+        set(PRODUCT_VERSION_BUILD 0)
     endif()
 
     if (NOT PRODUCT_COMPANY_COPYRIGHT OR "${PRODUCT_COMPANY_COPYRIGHT}" STREQUAL "")

@@ -326,7 +326,7 @@ void DatabaseTabWidget::mergeDatabase()
     if (dbWidget && !dbWidget->isLocked()) {
         auto filter = QString("%1 (*.kdbx);;%2 (*)").arg(tr("KeePass 2 Database"), tr("All files"));
         auto fileName =
-            fileDialog()->getOpenFileName(this, tr("Merge database"), FileDialog::getLastDir("merge"), filter);
+            fileDialog()->getOpenFileName(this, tr("Merge into Database"), FileDialog::getLastDir("merge"), filter);
         if (!fileName.isEmpty()) {
             FileDialog::saveLastDir("merge", fileName, true);
             mergeDatabase(fileName);

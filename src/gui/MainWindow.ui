@@ -521,10 +521,10 @@
   </action>
   <action name="actionDatabaseMerge">
    <property name="text">
-    <string>&amp;Merge From Database…</string>
+    <string>&amp;Merge into Database…</string>
    </property>
    <property name="toolTip">
-    <string>Merge From Database</string>
+    <string>Merge into Database</string>
    </property>
   </action>
   <action name="actionEntryNew">

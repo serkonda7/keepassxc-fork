@@ -39,6 +39,10 @@ MergeDialog::MergeDialog(QSharedPointer<Database> source, QSharedPointer<Databas
     m_ui->buttonBox->button(QDialogButtonBox::Ok)->setText(tr("Merge"));
     m_ui->buttonBox->button(QDialogButtonBox::Ok)->setFocus();
 
+    m_ui->infoLabel->setText(tr("Merge the currently open database into %1. "
+                              "Only the selected database file will be updated; the open database will not be changed.")
+                                 .arg(m_targetDatabase->filePath()));
+
     connect(m_ui->buttonBox, &QDialogButtonBox::rejected, this, &MergeDialog::cancelMerge);
     connect(m_ui->buttonBox, &QDialogButtonBox::accepted, this, &MergeDialog::performMerge);
 
@@ -58,6 +62,7 @@ MergeDialog::MergeDialog(const Merger::ChangeList& changes, QWidget* parent)
 
     m_ui->buttonBox->button(QDialogButtonBox::Ok)->setFocus();
     m_ui->buttonBox->button(QDialogButtonBox::Abort)->hide();
+    m_ui->infoLabel->hide();
 
     connect(m_ui->buttonBox, &QDialogButtonBox::accepted, this, &MergeDialog::close);
 
@@ -156,7 +161,7 @@ void MergeDialog::updateChangeTable()
     Q_ASSERT(m_sourceDatabase.get());
     Q_ASSERT(m_targetDatabase.get());
 
-    m_changes = Merger(m_sourceDatabase.data(), m_targetDatabase.get()).merge(true);
+    m_changes = Merger(m_sourceDatabase.data(), m_targetDatabase.data()).merge(true);
 
     m_ui->changeTable->clear();
 
@@ -182,6 +187,9 @@ void MergeDialog::updateChangeTable()
 
 void MergeDialog::performMerge()
 {
+    // Prevent re-entrant merges (e.g. from a double click)
+    m_ui->buttonBox->setEnabled(false);
+
     auto changes = Merger(m_sourceDatabase.data(), m_targetDatabase.data()).merge();
     if (changes != m_changes) {
         qWarning("Merge results differed from the expected changes. Expected: %lld, Actual: %lld",

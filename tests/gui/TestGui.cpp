@@ -347,14 +347,64 @@ void TestGui::testCreateDatabase()
     QTRY_VERIFY(dialogFinished);
 }
 
+void TestGui::testMergeDatabase_data()
+{
+    QTest::addColumn<bool>("confirm");
+    QTest::addColumn<bool>("unsavedChanges");
+    QTest::addColumn<bool>("identicalTarget");
+    QTest::addColumn<bool>("externalChanges");
+
+    QTest::newRow("merge-clean-source") << true << false << false << false;
+    QTest::newRow("merge-unsaved-source") << true << true << false << false;
+    QTest::newRow("cancel") << false << true << false << false;
+    QTest::newRow("no-changes") << true << false << true << false;
+    QTest::newRow("save-conflict") << true << true << false << true;
+}
+
 void TestGui::testMergeDatabase()
 {
+    QFETCH(bool, confirm);
+    QFETCH(bool, unsavedChanges);
+    QFETCH(bool, identicalTarget);
+    QFETCH(bool, externalChanges);
+
     // It is safe to ignore the warning this line produces
     QSignalSpy dbMergeSpy(m_dbWidget.data(), SIGNAL(databaseMerged(QSharedPointer<Database>)));
     QApplication::processEvents();
 
-    // Set file to merge from
-    fileDialog()->setNextFileName(QString(KEEPASSX_TEST_DATA_DIR).append("/MergeDatabase.kdbx"));
+    // Work on a temporary target so the test data is never modified.
+    TemporaryFile mergeDbFile;
+    QVERIFY(mergeDbFile.copyFromFile(identicalTarget ? m_dbFilePath
+                                                   : QString(KEEPASSX_TEST_DATA_DIR).append("/MergeDatabase.kdbx")));
+
+    QFile sourceFile(m_dbFilePath);
+    QVERIFY(sourceFile.open(QIODevice::ReadOnly));
+    const auto sourceContents = sourceFile.readAll();
+    sourceFile.close();
+    QFile targetFile(mergeDbFile.fileName());
+    QVERIFY(targetFile.open(QIODevice::ReadOnly));
+    auto targetContents = targetFile.readAll();
+    targetFile.close();
+
+    TemporaryFile backupFile;
+    QVERIFY(backupFile.open());
+    backupFile.close();
+    config()->set(Config::BackupBeforeSave, true);
+    config()->set(Config::BackupFilePathPattern, backupFile.fileName());
+
+    QUuid unsavedEntryUuid;
+    if (unsavedChanges) {
+        auto* entry = new Entry();
+        entry->setUuid(QUuid::createUuid());
+        entry->setTitle("Unsaved merge entry");
+        entry->setGroup(m_db->rootGroup()->findChildByName("Homebanking"));
+        unsavedEntryUuid = entry->uuid();
+    }
+    QTRY_COMPARE(m_db->isModified(), unsavedChanges);
+    QTRY_COMPARE(m_tabWidget->tabText(m_tabWidget->currentIndex()).contains("*"), unsavedChanges);
+
+    // Set file to merge into
+    fileDialog()->setNextFileName(mergeDbFile.fileName());
     triggerAction("actionDatabaseMerge");
 
     QWidget* editPasswordMerge;
@@ -364,33 +414,105 @@ void TestGui::testMergeDatabase()
     QTest::keyClicks(editPasswordMerge, "a");
     QTest::keyClick(editPasswordMerge, Qt::Key_Enter);
 
-    // Confirm merge in confirmation dialog
-    auto focusedWindow = QApplication::topLevelWindows().last();
-    QVERIFY(focusedWindow);
-    QTRY_VERIFY(focusedWindow->title().contains("Merge"));
+    // The preview must not modify either database file.
+    QDialog* mergeDialog = nullptr;
+    QTRY_VERIFY(mergeDialog = m_dbWidget->findChild<QDialog*>("MergeDialog"));
+    QVERIFY(mergeDialog->isVisible());
+    QVERIFY(targetFile.open(QIODevice::ReadOnly));
+    QCOMPARE(targetFile.readAll(), targetContents);
+    targetFile.close();
 
-    auto topLevelWidgets = QApplication::topLevelWidgets();
-    QWidget* mergeDialog = nullptr;
-    for (auto* widget : topLevelWidgets) {
-        if (widget && widget->objectName() == "MergeDialog") {
-            mergeDialog = widget;
-        }
+    if (externalChanges) {
+        // A change on disk after unlocking must not be silently overwritten.
+        QVERIFY(!targetContents.isEmpty());
+        targetContents[0] = char(targetContents.at(0) ^ 0xff);
+        QVERIFY(targetFile.open(QIODevice::WriteOnly));
+        QCOMPARE(targetFile.write(targetContents), qint64(targetContents.size()));
+        targetFile.close();
     }
 
-    QVERIFY(mergeDialog);
-    QTest::keyClick(mergeDialog, Qt::Key_Enter);
+    QTest::keyClick(mergeDialog, confirm ? Qt::Key_Enter : Qt::Key_Escape);
 
-    QTRY_COMPARE(dbMergeSpy.count(), 1);
-    QTRY_VERIFY(m_tabWidget->tabText(m_tabWidget->currentIndex()).contains("*"));
+    const bool expectChanges = confirm && !identicalTarget && !externalChanges;
+    if (expectChanges) {
+        QTRY_COMPARE(dbMergeSpy.count(), 1);
+        const auto savedDb = qvariant_cast<QSharedPointer<Database>>(dbMergeSpy.first().first());
+        QCOMPARE(savedDb->filePath(), mergeDbFile.fileName());
+        QVERIFY(!savedDb->isModified());
+    } else {
+        // Wait for the deferred completion handler, including the no-op case.
+        auto* message = m_dbWidget->currentWidget()->findChild<MessageWidget*>(QString(), Qt::FindDirectChildrenOnly);
+        QVERIFY(message);
+        if (externalChanges) {
+            QTRY_VERIFY(message->text().startsWith(
+                DatabaseWidget::tr("Error while saving database %1: %2").arg(mergeDbFile.fileName(), QString())));
+            QCOMPARE(message->messageType(), MessageWidget::Error);
+        } else {
+            QTRY_COMPARE(message->text(), confirm ? DatabaseWidget::tr("No changes were made by the merge operation.")
+                                                 : DatabaseWidget::tr("Merge canceled, no changes were made."));
+        }
+        QCOMPARE(dbMergeSpy.count(), 0);
+        QVERIFY(targetFile.open(QIODevice::ReadOnly));
+        QCOMPARE(targetFile.readAll(), targetContents);
+        targetFile.close();
+    }
 
-    m_db = m_tabWidget->currentDatabaseWidget()->database();
+    // Nothing is imported into or saved from the open database.
+    QCOMPARE(m_dbWidget->database(), m_db);
+    QCOMPARE(m_db->isModified(), unsavedChanges);
+    QCOMPARE(m_tabWidget->tabText(m_tabWidget->currentIndex()).contains("*"), unsavedChanges);
+    QVERIFY(sourceFile.open(QIODevice::ReadOnly));
+    QCOMPARE(sourceFile.readAll(), sourceContents);
+    sourceFile.close();
+    QCOMPARE(m_db->rootGroup()->children().size(), 6);
+    QCOMPARE(m_db->rootGroup()->findChildByName("General")->entries().size(), 0);
 
-    // there are seven child groups of the root group
-    QCOMPARE(m_db->rootGroup()->children().size(), 7);
-    // the merged group should contain an entry
-    QCOMPARE(m_db->rootGroup()->children().at(6)->entries().size(), 1);
-    // the General group contains one entry merged from the other db
-    QCOMPARE(m_db->rootGroup()->findChildByName("General")->entries().size(), 1);
+    if (!expectChanges) {
+        return;
+    }
+
+    // The backup must contain the selected database, not the source database.
+    QVERIFY(backupFile.open(QIODevice::ReadOnly));
+    QCOMPARE(backupFile.readAll(), targetContents);
+    backupFile.close();
+
+    // The target is saved, retaining its own entries and receiving source-only data.
+    auto key = QSharedPointer<CompositeKey>::create();
+    key->addKey(QSharedPointer<PasswordKey>::create("a"));
+    auto mergedDb = QSharedPointer<Database>::create();
+    QVERIFY(mergedDb->open(mergeDbFile.fileName(), key, nullptr));
+    QVERIFY(!mergedDb->isModified());
+    QCOMPARE(mergedDb->rootGroup()->children().size(), 7);
+    QCOMPARE(mergedDb->rootGroup()->findChildByName("General")->entries().size(), 1);
+    auto homebankingGroup = mergedDb->rootGroup()->findChildByName("Homebanking");
+    QVERIFY(homebankingGroup);
+    QCOMPARE(homebankingGroup->children().size(), 1);
+    QCOMPARE(homebankingGroup->children().first()->name(), QString("Subgroup"));
+    if (unsavedChanges) {
+        auto* mergedEntry = mergedDb->rootGroup()->findEntryByUuid(unsavedEntryUuid);
+        QVERIFY(mergedEntry);
+        QCOMPARE(mergedEntry->title(), QString("Unsaved merge entry"));
+    }
+}
+
+void TestGui::testMergeDatabaseIntoSelf()
+{
+    QSignalSpy dbMergeSpy(m_dbWidget.data(), SIGNAL(databaseMerged(QSharedPointer<Database>)));
+    fileDialog()->setNextFileName(m_dbFilePath);
+    triggerAction("actionDatabaseMerge");
+
+    QWidget* passwordEdit = nullptr;
+    QTRY_VERIFY((passwordEdit = QApplication::focusWidget()) && passwordEdit->objectName() == "passwordEdit");
+    QTest::keyClicks(passwordEdit, "a");
+    QTest::keyClick(passwordEdit, Qt::Key_Enter);
+
+    auto* message = m_dbWidget->currentWidget()->findChild<MessageWidget*>(QString(), Qt::FindDirectChildrenOnly);
+    QVERIFY(message);
+    QTRY_COMPARE(message->text(), DatabaseWidget::tr("Cannot merge a database into itself. Select a different database."));
+    QCOMPARE(message->messageType(), MessageWidget::Error);
+    QCOMPARE(dbMergeSpy.count(), 0);
+    QVERIFY(!m_db->isModified());
+    QVERIFY(!m_dbWidget->findChild<QDialog*>("MergeDialog"));
 }
 
 void TestGui::prepareAndTriggerRemoteSync()

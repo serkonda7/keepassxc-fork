@@ -426,6 +426,7 @@ if(WIN32)
             VERSION_MAJOR ${KEEPASSXC_VERSION_MAJOR}
             VERSION_MINOR ${KEEPASSXC_VERSION_MINOR}
             VERSION_PATCH ${KEEPASSXC_VERSION_PATCH}
+            VERSION_BUILD ${KEEPASSXC_VERSION_BUILD}
     )
     list(APPEND WIN32_ResourceFiles "${CMAKE_SOURCE_DIR}/share/windows/icon.rc")
     target_sources(${PROGNAME} PUBLIC ${WIN32_ResourceFiles})
@@ -640,6 +641,36 @@ if(WIN32)
     else()
         file(DOWNLOAD "https://curl.se/ca/cacert.pem" "${CMAKE_BINARY_DIR}/ca-bundle.crt" TLS_VERIFY ON)
         install(FILES "${CMAKE_BINARY_DIR}/ca-bundle.crt" DESTINATION "ssl/certs")
+    endif()
+
+    # Self-contained portable bundle for internal distribution (MSYS2/MinGW).
+    find_program(KPXC_POWERSHELL_EXECUTABLE NAMES powershell pwsh)
+    if(KPXC_POWERSHELL_EXECUTABLE)
+        get_filename_component(_kpxc_mingw_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        set(KPXC_PORTABLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/dist/KeePassXC" CACHE PATH
+            "Output directory for the Windows portable bundle (portable target)")
+        set(_kpxc_portable_dir "${KPXC_PORTABLE_OUTPUT_DIR}")
+        set(_kpxc_portable_deps ${PROGNAME})
+        if(TARGET keepassxc-cli)
+            list(APPEND _kpxc_portable_deps keepassxc-cli)
+        endif()
+        if(TARGET keepassxc-proxy)
+            list(APPEND _kpxc_portable_deps keepassxc-proxy)
+        endif()
+        add_custom_target(portable
+            COMMAND "${KPXC_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_SOURCE_DIR}/scripts/deploy-windows-portable.ps1"
+                -BuildDir "${CMAKE_BINARY_DIR}"
+                -SourceDir "${CMAKE_SOURCE_DIR}"
+                -OutputDir "${_kpxc_portable_dir}"
+                -MinGWBin "${_kpxc_mingw_bin}"
+                -Windeployqt "${DEPLOYQT_EXE}"
+                -Config "$<IF:$<CONFIG:Debug>,Debug,Release>"
+            DEPENDS ${_kpxc_portable_deps}
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            COMMENT "Creating portable Windows bundle in ${_kpxc_portable_dir}"
+            VERBATIM USES_TERMINAL
+        )
     endif()
 
 endif()

@@ -39,7 +39,9 @@ private slots:
 
     void testSettingsDefaultTabOrder();
     void testCreateDatabase();
+    void testMergeDatabase_data();
     void testMergeDatabase();
+    void testMergeDatabaseIntoSelf();
     void testRemoteSyncDatabaseSameKey();
     void testRemoteSyncDatabaseRequiresPassword();
     void testOpenRemoteDatabase();

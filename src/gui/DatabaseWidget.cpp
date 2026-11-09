@@ -1380,34 +1380,37 @@ void DatabaseWidget::mergeDatabase(bool accepted)
         if (!senderDialog) {
             return;
         }
-        auto srcDb = senderDialog->database();
+        auto targetDb = senderDialog->database();
 
-        if (!srcDb) {
-            showMessage(tr("No source database, nothing to do."), MessageWidget::Error);
+        if (!targetDb) {
+            showMessage(tr("No target database, nothing to do."), MessageWidget::Error);
             return;
         }
 
-#ifdef WITH_XC_KEESHARE
-        // Disable KeeShare while merging to avoid conflicts with incoming changes
-        KeeShare::instance()->setSharingEnabled(m_db, false);
-#endif
+        if (!m_db->canonicalFilePath().isEmpty() && m_db->canonicalFilePath() == targetDb->canonicalFilePath()) {
+            showMessage(tr("Cannot merge a database into itself. Select a different database."), MessageWidget::Error);
+            return;
+        }
 
-        auto* mergeDialog = new MergeDialog(srcDb, m_db, this);
-        connect(mergeDialog, &MergeDialog::databaseMerged, [this](bool changed) {
-            if (changed) {
-                showMessage(tr("Successfully merged the selected database."), MessageWidget::Positive);
-                emit databaseMerged(m_db);
-            } else {
-                showMessage(tr("No changes were made by the merge operation."), MessageWidget::Information);
-            }
-        });
-        connect(mergeDialog, &MergeDialog::finished, [this](int result) {
-            if (result == QDialog::Rejected) {
-                showMessage(tr("Merge canceled, no changes were made."), MessageWidget::Information);
-            }
-#ifdef WITH_XC_KEESHARE
-            KeeShare::instance()->setSharingEnabled(m_db, true);
-#endif
+        auto* mergeDialog = new MergeDialog(m_db, targetDb, this);
+        connect(mergeDialog, &MergeDialog::finished, this, [this, targetDb](int result) {
+            // Save after the dialog closes to avoid re-entering it during the save.
+            QTimer::singleShot(0, this, [this, targetDb, result] {
+                if (result == QDialog::Rejected) {
+                    showMessage(tr("Merge canceled, no changes were made."), MessageWidget::Information);
+                } else if (targetDb->isModified()) {
+                    QString error;
+                    if (saveDatabase(targetDb, {}, error)) {
+                        showMessage(tr("Successfully merged into the selected database."), MessageWidget::Positive);
+                        emit databaseMerged(targetDb);
+                    } else {
+                        showMessage(tr("Error while saving database %1: %2").arg(targetDb->filePath(), error),
+                                    MessageWidget::Error);
+                    }
+                } else {
+                    showMessage(tr("No changes were made by the merge operation."), MessageWidget::Information);
+                }
+            });
         });
         mergeDialog->open();
     }
@@ -2585,6 +2588,11 @@ bool DatabaseWidget::saveAs()
 
 bool DatabaseWidget::performSave(QString& errorMessage, const QString& fileName)
 {
+    return saveDatabase(m_db, fileName, errorMessage);
+}
+
+bool DatabaseWidget::saveDatabase(const QSharedPointer<Database>& db, const QString& fileName, QString& errorMessage)
+{
     QPointer<QWidget> focusWidget(qApp->focusWidget());
 
     // Lock out interactions
@@ -2611,7 +2619,7 @@ bool DatabaseWidget::performSave(QString& errorMessage, const QString& fileName)
             backupFilePath = config()->getDefault(Config::BackupFilePathPattern).toString();
         }
 
-        QFileInfo dbFileInfo(m_db->filePath());
+        QFileInfo dbFileInfo(db->filePath());
         backupFilePath = Tools::substituteBackupFilePath(backupFilePath, dbFileInfo.canonicalFilePath());
         if (!backupFilePath.isNull()) {
             // Note that we cannot guarantee that backupFilePath is actually a valid filename. QT currently provides
@@ -2625,9 +2633,9 @@ bool DatabaseWidget::performSave(QString& errorMessage, const QString& fileName)
 
     bool ok;
     if (fileName.isEmpty()) {
-        ok = m_db->save(saveAction, backupFilePath, &errorMessage);
+        ok = db->save(saveAction, backupFilePath, &errorMessage);
     } else {
-        ok = m_db->saveAs(fileName, saveAction, backupFilePath, &errorMessage);
+        ok = db->saveAs(fileName, saveAction, backupFilePath, &errorMessage);
     }
 
     // Return control
