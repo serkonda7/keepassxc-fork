@@ -39,6 +39,8 @@ image::keeshare_group_settings.png[]
 === Using Shared Credentials
 KeeShare watches the container for changes and merges them into your database when necessary (Import and Synchronize modes). Entries merge in time order; older data is moved to the history of the entry.
 
+Shared files are checked in the background every 30 seconds. If a network share is unavailable, the local database remains usable while the operating system attempts to access the share. Imports and failed exports are retried automatically; synchronization resumes when the share becomes accessible again.
+
 A shared group shows a cloud icon badge over the group icon *(A)* and a banner is displayed showing the sharing mode and file location *(B)*. If the share is disabled or unavailable, the cloud icon will show as red with a white X.
 
 .KeeShare shared group

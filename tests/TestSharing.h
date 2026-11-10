@@ -41,6 +41,11 @@ private slots:
     void testObserverRejectsInvalidReference();
     void testObserverReinitializeReentry();
     void testObserverDeferredImport();
+    void testObserverUnresponsiveShare();
+    void testObserverUnresponsiveShare_data();
+    void testObserverRetriesOfflineExport();
+    void testObserverRetriesOfflineImport();
+    void testObserverImportsBeforeExport();
     void testObserverSkipsUnchangedExport();
     void testObserverSkipsUnchangedExport_data();
     void testObserverSkipsUnchangedImport();

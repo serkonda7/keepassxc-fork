@@ -28,12 +28,12 @@ class ShareExport
     Q_DECLARE_TR_FUNCTIONS(ShareExport)
 public:
     /**
-     * Export the content of group into the container at resolvedPath.
+     * Serialize the content of group into containerData without accessing the share path.
      * If fingerprint is given and matches the content fingerprint of the group (see ShareFingerprint),
      * nothing is written and an invalid result is returned. After a successful export it receives
      * the fingerprint of the exported content.
      */
-    static ShareObserver::Result intoContainer(const QString& resolvedPath,
+    static ShareObserver::Result containerFrom(QByteArray& containerData,
                                                const KeeShareSettings::Reference& reference,
                                                const Group* group,
                                                QByteArray* fingerprint = nullptr);

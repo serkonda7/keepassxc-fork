@@ -29,6 +29,7 @@
 
 #include <../minizip/zip.h>
 #include <QBuffer>
+#include <QTemporaryFile>
 #include <botan/pubkey.h>
 
 // Compatibility with minizip-ng
@@ -197,11 +198,12 @@ namespace
     }
 } // namespace
 
-ShareObserver::Result ShareExport::intoContainer(const QString& resolvedPath,
+ShareObserver::Result ShareExport::containerFrom(QByteArray& containerData,
                                                  const KeeShareSettings::Reference& reference,
                                                  const Group* group,
                                                  QByteArray* fingerprint)
 {
+    containerData.clear();
     QScopedPointer<Database> targetDb(extractIntoDatabase(reference, group));
     // Fingerprint the extracted content so resolved references are covered as they are written
     const auto contentFingerprint = ShareFingerprint::of(targetDb->rootGroup(), reference);
@@ -209,7 +211,7 @@ ShareObserver::Result ShareExport::intoContainer(const QString& resolvedPath,
         // The container already holds this content, writing it again would only trigger other observers
         return {};
     }
-    if (resolvedPath.endsWith(".kdbx.share")) {
+    if (reference.path.endsWith(".kdbx.share")) {
         // Write database to memory and sign it
         QByteArray dbData, signatureData;
         QBuffer buffer;
@@ -236,7 +238,14 @@ ShareObserver::Result ShareExport::intoContainer(const QString& resolvedPath,
 
         signatureData = KeeShareSettings::Sign::serialize(sign).toLatin1();
 
-        auto zf = zipOpen64(resolvedPath.toLatin1().data(), 0);
+        // minizip requires a filename. Stage the signed container locally, never on the share.
+        QTemporaryFile container;
+        if (!container.open()) {
+            return {reference.path, ShareObserver::Result::Error, container.errorString()};
+        }
+        const auto containerPath = container.fileName();
+        container.close();
+        auto zf = zipOpen64(QFile::encodeName(containerPath).constData(), 0);
         if (!zf) {
             return {reference.path, ShareObserver::Result::Error, ShareExport::tr("Could not write export container.")};
         }
@@ -245,16 +254,24 @@ ShareObserver::Result ShareExport::intoContainer(const QString& resolvedPath,
         writeZipFile(zf, KeeShare::containerFileName().toLatin1().data(), dbData);
 
         zipClose(zf, nullptr);
+        if (!container.open()) {
+            return {reference.path, ShareObserver::Result::Error, container.errorString()};
+        }
+        containerData = container.readAll();
+        if (container.error() != QFileDevice::NoError) {
+            return {reference.path, ShareObserver::Result::Error, container.errorString()};
+        }
     } else {
-        QString error;
-        if (!targetDb->saveAs(resolvedPath, Database::Atomic, {}, &error)) {
-            qWarning("Exporting database failed: %s.", error.toLatin1().data());
-            return {resolvedPath, ShareObserver::Result::Error, error};
+        QBuffer buffer(&containerData);
+        buffer.open(QIODevice::WriteOnly);
+        KeePass2Writer writer;
+        if (!writer.writeDatabase(&buffer, targetDb.data())) {
+            return {reference.path, ShareObserver::Result::Error, writer.errorString()};
         }
     }
 
     if (fingerprint) {
         *fingerprint = contentFingerprint;
     }
-    return {resolvedPath};
+    return {reference.path};
 }

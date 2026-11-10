@@ -18,7 +18,10 @@
 #include "TestSharing.h"
 
 #include <QTemporaryDir>
+#include <QSemaphore>
+#include <QSignalSpy>
 #include <QTest>
+#include <QtConcurrent>
 #include <QXmlStreamReader>
 
 #include "core/Config.h"
@@ -43,6 +46,53 @@ QTEST_GUILESS_MAIN(TestSharing)
 Q_DECLARE_METATYPE(KeeShareSettings::Type)
 Q_DECLARE_METATYPE(KeeShareSettings::Key)
 Q_DECLARE_METATYPE(KeeShareSettings::Certificate)
+
+namespace
+{
+    // Keep file jobs queued to deterministically simulate an unresponsive filesystem,
+    // without relying on a real SMB server or the platform's network timeout.
+    class BlockFileJobs
+    {
+    public:
+        BlockFileJobs()
+            : m_previousMax(QThreadPool::globalInstance()->maxThreadCount())
+        {
+            QThreadPool::globalInstance()->setMaxThreadCount(1);
+            m_future = QtConcurrent::run([this] {
+                m_started.release();
+                m_release.acquire();
+            });
+            m_started.acquire();
+        }
+
+        ~BlockFileJobs()
+        {
+            release();
+            QThreadPool::globalInstance()->setMaxThreadCount(m_previousMax);
+        }
+
+        void release()
+        {
+            if (!m_future.isFinished()) {
+                m_release.release();
+                m_future.waitForFinished();
+            }
+        }
+
+    private:
+        int m_previousMax;
+        QSemaphore m_started;
+        QSemaphore m_release;
+        QFuture<void> m_future;
+    };
+
+    bool exportDatabase(const QSharedPointer<Database>& db, ShareObserver& observer)
+    {
+        QSignalSpy finished(&observer, &ShareObserver::exportFinished);
+        emit db->databaseSaved();
+        return !finished.isEmpty() || finished.wait(10000);
+    }
+} // namespace
 
 void TestSharing::initTestCase()
 {
@@ -254,7 +304,7 @@ void TestSharing::testObserverReinitializeReentry()
     });
 
     emit db->groupDataChanged(db->rootGroup());
-    QCOMPARE(messages, 1);
+    QTRY_VERIFY(messages >= 1);
     // Retry the blocked reference change without another notification.
     QTRY_COMPARE(messages, 2);
 }
@@ -289,6 +339,9 @@ void TestSharing::testObserverDeferredImport()
     active.in = true;
     KeeShare::setActive(active);
     ShareObserver observer(db);
+    QSignalSpy initialMessages(&observer, &ShareObserver::sharingMessage);
+    QTRY_VERIFY(!initialMessages.isEmpty());
+    QTRY_VERIFY(observer.findChildren<QFutureWatcherBase*>().isEmpty());
 
     QPointer<Group> victim = new Group();
     victim->setUuid(QUuid::createUuid());
@@ -306,6 +359,178 @@ void TestSharing::testObserverDeferredImport()
     QVERIFY(QMetaObject::invokeMethod(&observer, "handleFileUpdated", Q_ARG(QString, sharePath)));
     QTRY_VERIFY(victim.isNull());
     QTRY_VERIFY(messages.join('\n').contains("missing.kdbx"));
+}
+
+void TestSharing::testObserverUnresponsiveShare_data()
+{
+    QTest::addColumn<bool>("importing");
+    QTest::newRow("import") << true;
+    QTest::newRow("export") << false;
+}
+
+void TestSharing::testObserverUnresponsiveShare()
+{
+    QFETCH(bool, importing);
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto db = QSharedPointer<Database>::create();
+    db->setFilePath(directory.filePath("local.kdbx"));
+    KeeShareSettings::Reference reference;
+    reference.type = importing ? KeeShareSettings::ImportFrom : KeeShareSettings::ExportTo;
+    reference.path = directory.filePath("unreachable/share.kdbx");
+    KeeShare::setReferenceTo(db->rootGroup(), reference);
+    KeeShareSettings::Active active;
+    active.in = active.out = true;
+    KeeShare::setActive(active);
+
+    BlockFileJobs blocked;
+    ShareObserver observer(db);
+    QSignalSpy messages(&observer, &ShareObserver::sharingMessage);
+    if (!importing) {
+        emit db->databaseSaved();
+    }
+    QTRY_COMPARE(observer.findChildren<QFutureWatcherBase*>().size(), 1);
+
+    // Polls and repeated saves must not enqueue unbounded jobs for the same path.
+    for (int i = 0; i < 5; ++i) {
+        QVERIFY(QMetaObject::invokeMethod(&observer, "pollShares"));
+        emit db->databaseSaved();
+    }
+    QCOMPARE(observer.findChildren<QFutureWatcherBase*>().size(), 1);
+    bool responsive = false;
+    QTimer::singleShot(0, this, [&] { responsive = true; });
+    QTRY_VERIFY(responsive);
+    QVERIFY(messages.isEmpty());
+
+    // Locking/disabling the database invalidates the outstanding result, without waiting for I/O.
+    observer.setEnabled(false);
+    blocked.release();
+    QTRY_VERIFY(observer.findChildren<QFutureWatcherBase*>().isEmpty());
+    QVERIFY(messages.isEmpty());
+    QVERIFY(!QFile::exists(reference.path));
+
+    // Destroying the observer while a job is queued is safe as well.
+    {
+        BlockFileJobs blockedAgain;
+        auto transient = new ShareObserver(db);
+        emit db->databaseSaved();
+        QTRY_COMPARE(transient->findChildren<QFutureWatcherBase*>().size(), 1);
+        delete transient;
+    }
+    QThreadPool::globalInstance()->waitForDone();
+}
+
+void TestSharing::testObserverRetriesOfflineExport()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto db = QSharedPointer<Database>::create();
+    db->setFilePath(directory.filePath("local.kdbx"));
+    auto* entry = new Entry();
+    entry->setUuid(QUuid::createUuid());
+    entry->setTitle("Offline edit");
+    entry->setGroup(db->rootGroup());
+    KeeShareSettings::Reference reference;
+    reference.type = KeeShareSettings::SynchronizeWith;
+    reference.password = "share-password";
+    reference.path = directory.filePath("offline/share.kdbx");
+    KeeShare::setReferenceTo(db->rootGroup(), reference);
+    KeeShareSettings::Active active;
+    active.in = active.out = true;
+    KeeShare::setActive(active);
+    ShareObserver observer(db);
+    QVERIFY(exportDatabase(db, observer));
+    QVERIFY(!QFile::exists(reference.path));
+
+    // Simulate reconnecting. No second local save is needed to retry the failed export.
+    QVERIFY(QDir(directory.path()).mkdir("offline"));
+    QSignalSpy finished(&observer, &ShareObserver::exportFinished);
+    QVERIFY(QMetaObject::invokeMethod(&observer, "pollShares"));
+    QTRY_VERIFY(!finished.isEmpty());
+    QVERIFY(QFile::exists(reference.path));
+    Database readBack;
+    auto key = QSharedPointer<CompositeKey>::create();
+    key->addKey(QSharedPointer<PasswordKey>::create(reference.password));
+    QVERIFY(readBack.open(reference.path, key));
+    QVERIFY(readBack.rootGroup()->findEntryByUuid(entry->uuid()));
+}
+
+void TestSharing::testObserverRetriesOfflineImport()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    auto db = QSharedPointer<Database>::create();
+    db->setFilePath(directory.filePath("local.kdbx"));
+    KeeShareSettings::Reference reference;
+    reference.type = KeeShareSettings::ImportFrom;
+    reference.password = "share-password";
+    reference.path = directory.filePath("share.kdbx");
+    KeeShare::setReferenceTo(db->rootGroup(), reference);
+    KeeShareSettings::Active active;
+    active.in = true;
+    KeeShare::setActive(active);
+    ShareObserver observer(db);
+    QSignalSpy messages(&observer, &ShareObserver::sharingMessage);
+    QTRY_VERIFY(!messages.isEmpty());
+
+    Database source;
+    auto key = QSharedPointer<CompositeKey>::create();
+    key->addKey(QSharedPointer<PasswordKey>::create(reference.password));
+    auto kdf = QSharedPointer<AesKdf>::create();
+    QVERIFY(kdf->setRounds(1));
+    source.setKdf(kdf);
+    QVERIFY(source.setKey(key));
+    auto* entry = new Entry();
+    entry->setUuid(QUuid::createUuid());
+    entry->setTitle("Available again");
+    entry->setGroup(source.rootGroup());
+    QVERIFY(source.saveAs(reference.path));
+    QVERIFY(QMetaObject::invokeMethod(&observer, "pollShares"));
+    QTRY_VERIFY(db->rootGroup()->findEntryByUuid(entry->uuid()));
+    QCOMPARE(db->rootGroup()->findEntryByUuid(entry->uuid())->title(), entry->title());
+}
+
+void TestSharing::testObserverImportsBeforeExport()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    KeeShareSettings::Reference reference;
+    reference.type = KeeShareSettings::SynchronizeWith;
+    reference.password = "share-password";
+    reference.path = directory.filePath("share.kdbx");
+
+    Database source;
+    auto key = QSharedPointer<CompositeKey>::create();
+    key->addKey(QSharedPointer<PasswordKey>::create(reference.password));
+    auto kdf = QSharedPointer<AesKdf>::create();
+    QVERIFY(kdf->setRounds(1));
+    source.setKdf(kdf);
+    QVERIFY(source.setKey(key));
+    auto* remote = new Entry();
+    remote->setUuid(QUuid::createUuid());
+    remote->setTitle("Remote entry");
+    remote->setGroup(source.rootGroup());
+    QVERIFY(source.saveAs(reference.path));
+
+    auto db = QSharedPointer<Database>::create();
+    db->setFilePath(directory.filePath("local.kdbx"));
+    auto* local = new Entry();
+    local->setUuid(QUuid::createUuid());
+    local->setTitle("Local entry");
+    local->setGroup(db->rootGroup());
+    KeeShare::setReferenceTo(db->rootGroup(), reference);
+    KeeShareSettings::Active active;
+    active.in = active.out = true;
+    KeeShare::setActive(active);
+    ShareObserver observer(db);
+
+    // A save immediately after unlocking must not overwrite the not-yet-imported master.
+    QVERIFY(exportDatabase(db, observer));
+    QVERIFY(db->rootGroup()->findEntryByUuid(remote->uuid()));
+    Database readBack;
+    QVERIFY(readBack.open(reference.path, key));
+    QVERIFY(readBack.rootGroup()->findEntryByUuid(remote->uuid()));
+    QVERIFY(readBack.rootGroup()->findEntryByUuid(local->uuid()));
 }
 
 void TestSharing::testObserverSkipsUnchangedExport_data()
@@ -379,14 +604,14 @@ void TestSharing::testObserverSkipsUnchangedExport()
     };
 
     // First export writes the container
-    emit db->databaseSaved();
+    QVERIFY(exportDatabase(db, observer));
     const auto exported = readShare();
     QVERIFY(!exported.isEmpty());
 
     // Nothing changed, the container must not be rewritten (a rewrite has fresh IVs and salts).
     // Wait so that timestamps stamped during export would differ in their seconds.
     QTest::qWait(1100);
-    emit db->databaseSaved();
+    QVERIFY(exportDatabase(db, observer));
     QCOMPARE(readShare(), exported);
 
     // Statistics are not shared content
@@ -396,7 +621,7 @@ void TestSharing::testObserverSkipsUnchangedExport()
     timeInfo.setUsageCount(timeInfo.usageCount() + 1);
     entry->setTimeInfo(timeInfo);
     entry->setUpdateTimeinfo(true);
-    emit db->databaseSaved();
+    QVERIFY(exportDatabase(db, observer));
     QCOMPARE(readShare(), exported);
 
     const auto shareKey = QSharedPointer<CompositeKey>::create();
@@ -412,15 +637,15 @@ void TestSharing::testObserverSkipsUnchangedExport()
     QVERIFY(rewritten != exported);
     QVERIFY(QMetaObject::invokeMethod(&observer, "handleFileUpdated", Q_ARG(QString, sharePath)));
     QTest::qWait(300);
-    emit db->databaseSaved();
+    QVERIFY(exportDatabase(db, observer));
     QCOMPARE(readShare(), rewritten);
 
     // Local changes are exported
     entry->setTitle("Changed");
-    emit db->databaseSaved();
+    QVERIFY(exportDatabase(db, observer));
     const auto changed = readShare();
     QVERIFY(changed != exported);
-    emit db->databaseSaved();
+    QVERIFY(exportDatabase(db, observer));
     QCOMPARE(readShare(), changed);
 
     // A container modified behind our back is rewritten even though local content did not change
@@ -430,7 +655,7 @@ void TestSharing::testObserverSkipsUnchangedExport()
         QVERIFY(file.open(QIODevice::WriteOnly));
         file.write(exported);
     }
-    emit db->databaseSaved();
+    QVERIFY(exportDatabase(db, observer));
     QVERIFY(readShare() != exported);
 
     Database readBack;
@@ -440,7 +665,7 @@ void TestSharing::testObserverSkipsUnchangedExport()
 
     // A deleted container is written again
     QVERIFY(QFile::remove(sharePath));
-    emit db->databaseSaved();
+    QVERIFY(exportDatabase(db, observer));
     QVERIFY(QFile::exists(sharePath));
 
     if (outOfScopeReference) {
@@ -454,7 +679,7 @@ void TestSharing::testObserverSkipsUnchangedExport()
         QTest::qWait(1100);
         outside->setPassword("changed-outside-password");
         const auto beforeChange = readShare();
-        emit db->databaseSaved();
+        QVERIFY(exportDatabase(db, observer));
         QVERIFY(readShare() != beforeChange);
         Database updated;
         QVERIFY(updated.open(sharePath, shareKey));
@@ -468,7 +693,7 @@ void TestSharing::testObserverSkipsUnchangedExport()
         // ... and is stable afterwards
         const auto afterChange = readShare();
         QTest::qWait(1100);
-        emit db->databaseSaved();
+        QVERIFY(exportDatabase(db, observer));
         QCOMPARE(readShare(), afterChange);
     }
 }
@@ -504,7 +729,7 @@ void TestSharing::testObserverSkipsUnchangedImport()
     active.out = true;
     KeeShare::setActive(active);
     ShareObserver observer(db);
-    emit db->databaseSaved();
+    QVERIFY(exportDatabase(db, observer));
     QVERIFY(QFile::exists(sharePath));
 
     QStringList messages;
@@ -550,7 +775,7 @@ void TestSharing::testObserverSkipsUnchangedImport()
     QCOMPARE(messages.size(), 1);
 
     // The local deletion is still exported
-    emit db->databaseSaved();
+    QVERIFY(exportDatabase(db, observer));
     Database readBack;
     QVERIFY(readBack.open(sharePath, shareKey));
     QVERIFY(readBack.rootGroup()->findEntryByUuid(addedUuid));
@@ -585,7 +810,7 @@ void TestSharing::testObserverImportsSignedContainer()
     entry->setGroup(sourceShare);
     KeeShare::setReferenceTo(sourceShare, reference);
     ShareObserver sourceObserver(source);
-    emit source->databaseSaved();
+    QVERIFY(exportDatabase(source, sourceObserver));
     QVERIFY(QFile::exists(sharePath));
 
     // A second database imports it: the zip is read from memory
@@ -599,7 +824,7 @@ void TestSharing::testObserverImportsSignedContainer()
         reference.type = KeeShareSettings::ImportFrom;
         KeeShare::setReferenceTo(targetShare, reference);
         ShareObserver targetObserver(target);
-        QVERIFY(targetShare->findEntryByUuid(entry->uuid()));
+        QTRY_VERIFY(targetShare->findEntryByUuid(entry->uuid()));
         QCOMPARE(targetShare->findEntryByUuid(entry->uuid())->title(), QString("Signed"));
     }
 

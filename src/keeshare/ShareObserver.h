@@ -22,11 +22,12 @@
 #include <QMap>
 #include <QObject>
 #include <QSet>
+#include <QTimer>
+#include <atomic>
 
 #include "gui/MessageWidget.h"
 #include "keeshare/KeeShareSettings.h"
 
-class FileWatcher;
 class Group;
 class Database;
 
@@ -65,6 +66,7 @@ public:
 
 signals:
     void importFinished();
+    void exportFinished();
     void sharingMessage(QString, MessageWidget::MessageType);
 
 private slots:
@@ -72,25 +74,32 @@ private slots:
     void handleDatabaseSaved();
     void handleImportFinished();
     void handleFileUpdated(QString path);
+    void pollShares();
 
 private:
     void triggerImport(const QString& path);
-    Result importShare(const QString& path);
-    QList<Result> exportShares();
+    void importShare(const QString& path);
+    void exportShare(const QString& path);
+    void processPendingExports();
+    void notifyAbout(const Result& result, bool importing);
 
     void deinitialize();
     void reinitialize();
     void notifyAbout(const QStringList& success, const QStringList& warning, const QStringList& error);
 
-    QByteArray knownFingerprint(const QString& resolvedPath) const;
     void rememberFingerprint(const QString& resolvedPath, const QByteArray& fingerprint, const QByteArray& digest);
 
 private:
     QSharedPointer<Database> m_db;
     QMap<QPointer<Group>, KeeShareSettings::Reference> m_groupToReference;
     QMap<QString, QPointer<Group>> m_shareToGroup;
-    QMap<QString, QSharedPointer<FileWatcher>> m_fileWatchers;
+    QTimer m_pollTimer;
+    QSet<QString> m_busyPaths;
     QSet<QString> m_pendingImports;
+    QSet<QString> m_pendingExports;
+    QSet<QString> m_retryExports;
+    QHash<QString, QSharedPointer<std::atomic_bool>> m_exportTokens;
+    quint64 m_generation = 0;
 
     // Content last imported from or exported to a share file, keyed by resolved path
     struct ShareState
@@ -102,6 +111,7 @@ private:
     bool m_reinitializePending = false;
     bool m_inReinitialize = false;
     bool m_inImport = false;
+    bool m_inExport = false;
     bool m_enabled = true;
 };
 

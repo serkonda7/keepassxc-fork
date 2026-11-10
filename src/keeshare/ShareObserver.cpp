@@ -16,7 +16,7 @@
  */
 
 #include "ShareObserver.h"
-#include "core/FileWatcher.h"
+#include "core/AsyncTask.h"
 #include "core/Group.h"
 #include "crypto/CryptoHash.h"
 #include "keeshare/KeeShare.h"
@@ -26,6 +26,7 @@
 #include <QDir>
 #include <QScopeGuard>
 #include <QScopedValueRollback>
+#include <QSaveFile>
 
 namespace
 {
@@ -35,25 +36,59 @@ namespace
         return info.absoluteDir().absoluteFilePath(path);
     }
 
-    QByteArray fileDigest(const QString& resolvedPath)
+    struct FileContents
+    {
+        QByteArray data;
+        QByteArray digest;
+        QString error;
+    };
+
+    // These functions must only run on workers. Even open()/exists() can block for
+    // minutes while the operating system tries to reconnect an offline share.
+    FileContents readShareFile(const QString& resolvedPath)
     {
         QFile file(resolvedPath);
         if (!file.open(QIODevice::ReadOnly)) {
+            return {{}, {}, file.errorString()};
+        }
+        const auto data = file.readAll();
+        if (file.error() != QFileDevice::NoError) {
+            return {{}, {}, file.errorString()};
+        }
+        return {data, CryptoHash::hash(data, CryptoHash::Sha256), {}};
+    }
+
+    QString writeShareFile(const QString& path,
+                           const QByteArray& data,
+                           const QByteArray& expectedDigest,
+                           const QSharedPointer<std::atomic_bool>& enabled)
+    {
+        if (!enabled->load()) {
             return {};
         }
-        CryptoHash hash(CryptoHash::Sha256);
-        while (!file.atEnd()) {
-            const auto data = file.read(64 * 1024);
-            if (data.isEmpty() && file.error() != QFileDevice::NoError) {
-                return {};
-            }
-            hash.addData(data);
+        // Do not overwrite a concurrent remote update while preparing the export.
+        const auto current = readShareFile(path);
+        if (!enabled->load()) {
+            return {};
         }
-        return hash.result();
+        if (current.digest != expectedDigest) {
+            return ShareObserver::tr("The share changed during export. Retry synchronization.");
+        }
+        QSaveFile file(path);
+        if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size()) {
+            return file.errorString();
+        }
+        if (!enabled->load()) {
+            file.cancelWriting();
+            return {};
+        }
+        if (!file.commit()) {
+            return file.errorString();
+        }
+        return {};
     }
 
     constexpr int FileWatchPeriod = 30;
-    constexpr int FileWatchSize = 5;
 } // End Namespace
 
 ShareObserver::ShareObserver(QSharedPointer<Database> db, QObject* parent)
@@ -61,6 +96,8 @@ ShareObserver::ShareObserver(QSharedPointer<Database> db, QObject* parent)
     , m_db(std::move(db))
 {
     connect(this, &ShareObserver::importFinished, this, &ShareObserver::handleImportFinished, Qt::QueuedConnection);
+    connect(&m_pollTimer, &QTimer::timeout, this, &ShareObserver::pollShares);
+    m_pollTimer.setInterval(FileWatchPeriod * 1000);
 
     connect(KeeShare::instance(), &KeeShare::activeChanged, this, &ShareObserver::handleDatabaseChanged);
 
@@ -76,27 +113,52 @@ ShareObserver::ShareObserver(QSharedPointer<Database> db, QObject* parent)
 
 ShareObserver::~ShareObserver()
 {
+    for (const auto& token : m_exportTokens) {
+        token->store(false);
+    }
     m_db->disconnect(this);
 }
 
 void ShareObserver::setEnabled(bool enabled)
 {
     m_enabled = enabled;
+    handleDatabaseChanged();
+}
+
+void ShareObserver::pollShares()
+{
+    m_pendingExports.unite(m_retryExports);
+    // Import first after reconnecting, before retrying failed exports.
+    for (auto it = m_shareToGroup.cbegin(); it != m_shareToGroup.cend(); ++it) {
+        if (it.value() && KeeShare::referenceOf(it.value()).isImporting()) {
+            m_pendingImports.insert(it.key());
+            triggerImport(it.key());
+        }
+    }
+    processPendingExports();
 }
 
 void ShareObserver::deinitialize()
 {
+    for (const auto& token : m_exportTokens) {
+        token->store(false);
+    }
+    m_exportTokens.clear();
+    ++m_generation;
+    m_pollTimer.stop();
+    m_busyPaths.clear();
+    m_pendingExports.clear();
+    m_retryExports.clear();
     m_pendingImports.clear();
     m_reinitializePending = false;
     m_groupToReference.clear();
     m_shareToGroup.clear();
-    m_fileWatchers.clear();
     m_shareStates.clear();
 }
 
 void ShareObserver::reinitialize()
 {
-    if (m_inReinitialize || m_inImport) {
+    if (m_inReinitialize || m_inImport || m_inExport) {
         m_reinitializePending = true;
         return;
     }
@@ -112,9 +174,14 @@ void ShareObserver::reinitialize()
         }
 
         const auto oldResolvedPath = resolvePath(oldReference.path, m_db);
+        const auto token = m_exportTokens.value(oldResolvedPath);
+        if (token) {
+            token->store(false);
+        }
         m_groupToReference.remove(group);
         m_shareToGroup.remove(oldResolvedPath);
-        m_fileWatchers.remove(oldResolvedPath);
+        m_pendingExports.remove(oldResolvedPath);
+        m_retryExports.remove(oldResolvedPath);
         m_shareStates.remove(oldResolvedPath);
 
         if (!newReference.isValid()) {
@@ -141,13 +208,6 @@ void ShareObserver::reinitialize()
             continue;
         }
 
-        if (!reference.path.isEmpty() && reference.type != KeeShareSettings::Inactive) {
-            const auto newResolvedPath = resolvePath(reference.path, m_db);
-            auto fileWatcher = QSharedPointer<FileWatcher>::create(this);
-            connect(fileWatcher.data(), &FileWatcher::fileChanged, this, &ShareObserver::handleFileUpdated);
-            fileWatcher->start(newResolvedPath, FileWatchPeriod, FileWatchSize);
-            m_fileWatchers.insert(newResolvedPath, fileWatcher);
-        }
         if (reference.isExporting()) {
             exported[reference.path] << group->name();
             // export is only on save
@@ -155,22 +215,8 @@ void ShareObserver::reinitialize()
 
         if (reference.isImporting()) {
             imported[reference.path] << group->name();
-            // import has to occur immediately
-            const auto result = this->importShare(reference.path);
-            if (!result.isValid()) {
-                // tolerable result - blocked import or missing source
-                continue;
-            }
-
-            if (result.isError()) {
-                error << tr("Import from %1 failed (%2)").arg(result.path).arg(result.message);
-            } else if (result.isWarning()) {
-                warning << tr("Import from %1 failed (%2)").arg(result.path).arg(result.message);
-            } else if (result.isInfo()) {
-                success << tr("Import from %1 successful (%2)").arg(result.path).arg(result.message);
-            } else {
-                success << tr("Imported from %1").arg(result.path);
-            }
+            // Queue the initial import without touching the filesystem on the UI thread.
+            handleFileUpdated(resolvePath(reference.path, m_db));
         }
     }
 
@@ -186,6 +232,11 @@ void ShareObserver::reinitialize()
         }
     }
 
+    if (!m_shareToGroup.isEmpty() && !m_pollTimer.isActive()) {
+        m_pollTimer.start();
+    } else if (m_shareToGroup.isEmpty()) {
+        m_pollTimer.stop();
+    }
     notifyAbout(success, warning, error);
 }
 
@@ -225,7 +276,7 @@ void ShareObserver::handleDatabaseChanged()
 
 void ShareObserver::handleImportFinished()
 {
-    if (m_inImport || m_inReinitialize) {
+    if (m_inImport || m_inExport || m_inReinitialize) {
         return;
     }
     if (m_reinitializePending) {
@@ -236,6 +287,7 @@ void ShareObserver::handleImportFinished()
     for (const auto& path : pendingImports) {
         triggerImport(path);
     }
+    processPendingExports();
 }
 
 void ShareObserver::handleFileUpdated(QString path)
@@ -245,7 +297,7 @@ void ShareObserver::handleFileUpdated(QString path)
         return;
     }
     m_pendingImports.insert(path);
-    if (m_inImport || m_inReinitialize) {
+    if (m_inImport || m_inExport || m_inReinitialize) {
         return;
     }
     QTimer::singleShot(100, this, [this, path] { triggerImport(path); });
@@ -256,14 +308,18 @@ void ShareObserver::triggerImport(const QString& path)
     if (!m_pendingImports.remove(path)) {
         return;
     }
-    if (m_inImport || m_inReinitialize) {
+    if (m_inImport || m_inExport || m_inReinitialize || m_busyPaths.contains(path)) {
         m_pendingImports.insert(path);
         return;
     }
     if (!m_shareToGroup.value(path)) {
         return;
     }
-    const Result result = importShare(path);
+    importShare(path);
+}
+
+void ShareObserver::notifyAbout(const Result& result, bool importing)
+{
     if (!result.isValid()) {
         return;
     }
@@ -271,84 +327,82 @@ void ShareObserver::triggerImport(const QString& path)
     QStringList warning;
     QStringList error;
     if (result.isError()) {
-        error << tr("Import from %1 failed (%2)").arg(result.path, result.message);
+        error << (importing ? tr("Import from %1 failed (%2)") : tr("Export to %1 failed (%2)"))
+                     .arg(result.path, result.message);
     } else if (result.isWarning()) {
-        warning << tr("Import from %1 failed (%2)").arg(result.path, result.message);
+        warning << (importing ? tr("Import from %1 failed (%2)") : tr("Export to %1 failed (%2)"))
+                       .arg(result.path, result.message);
     } else if (result.isInfo()) {
-        success << tr("Import from %1 successful (%2)").arg(result.path, result.message);
+        success << (importing ? tr("Import from %1 successful (%2)") : tr("Export to %1 successful (%2)"))
+                       .arg(result.path, result.message);
     } else {
-        success << tr("Imported from %1").arg(result.path);
+        success << (importing ? tr("Imported from %1") : tr("Export to %1")).arg(result.path);
     }
     notifyAbout(success, warning, error);
 }
 
-ShareObserver::Result ShareObserver::importShare(const QString& path)
+void ShareObserver::importShare(const QString& path)
 {
-    auto finished = qScopeGuard([this] { emit importFinished(); });
     if (m_inImport || !KeeShare::active().in) {
-        return {};
+        return;
     }
     const auto changePath = resolvePath(path, m_db);
     auto shareGroup = m_shareToGroup.value(changePath);
     if (!shareGroup) {
         qWarning("Group for %s does not exist", qPrintable(path));
-        return {};
+        return;
     }
     const auto reference = KeeShare::referenceOf(shareGroup);
     if (reference.type == KeeShareSettings::Inactive) {
         // changes of inactive references are ignored
-        return {};
+        return;
     }
     if (reference.type == KeeShareSettings::ExportTo) {
         // changes of export only references are ignored
-        return {};
+        return;
     }
 
     Q_ASSERT(shareGroup->database() == m_db);
     Q_ASSERT(shareGroup == m_db->rootGroup()->findGroupByUuid(shareGroup->uuid()));
     const auto resolvedPath = resolvePath(reference.path, m_db);
 
-    // Prevent synchronous reentry by database change signals during import.
-    QScopedValueRollback importGuard(m_inImport, true);
-    // Read the file once: the digest then describes exactly the bytes that are parsed
-    QByteArray containerData;
-    {
-        QFile file(resolvedPath);
-        if (!file.open(QIODevice::ReadOnly)) {
-            qCritical("Unable to open file %s.", qPrintable(reference.path));
-            m_shareStates.remove(resolvedPath);
-            return {reference.path, Result::Error, file.errorString()};
-        }
-        containerData = file.readAll();
-        if (file.error() != QFileDevice::NoError) {
-            m_shareStates.remove(resolvedPath);
-            return {reference.path, Result::Error, file.errorString()};
-        }
-    }
-    const auto digest = CryptoHash::hash(containerData, CryptoHash::Sha256);
-    const auto state = m_shareStates.value(resolvedPath);
-    if (digest == state.fileDigest && !state.fingerprint.isEmpty()) {
-        // The very file we last imported or exported, nothing to parse or merge
-        return {};
-    }
-    // Lets the import skip the merge if the content is what we last synchronized
-    QByteArray fingerprint = state.fingerprint;
-    const auto result = ShareImport::containerInto(containerData, reference, shareGroup, &fingerprint);
-    rememberFingerprint(resolvedPath, fingerprint, digest);
-    return result;
-}
-
-QByteArray ShareObserver::knownFingerprint(const QString& resolvedPath) const
-{
-    const auto state = m_shareStates.value(resolvedPath);
-    if (state.fingerprint.isEmpty() || state.fileDigest.isEmpty()) {
-        return {};
-    }
-    // Only trust the fingerprint if nobody modified the file since we last read or wrote it
-    if (fileDigest(resolvedPath) != state.fileDigest) {
-        return {};
-    }
-    return state.fingerprint;
+    const auto generation = m_generation;
+    m_busyPaths.insert(resolvedPath);
+    AsyncTask::runThenCallback(
+        [resolvedPath] { return readShareFile(resolvedPath); },
+        this,
+        [this, resolvedPath, reference, shareGroup, generation](const FileContents& contents) {
+            if (generation != m_generation) {
+                return;
+            }
+            auto finished = qScopeGuard([this, resolvedPath] {
+                m_busyPaths.remove(resolvedPath);
+                emit importFinished();
+            });
+            // A database can be locked or its sharing configuration changed while I/O is pending.
+            if (!m_enabled || !KeeShare::active().in || !shareGroup
+                || !(KeeShare::referenceOf(shareGroup) == reference)
+                || m_shareToGroup.value(resolvedPath) != shareGroup) {
+                return;
+            }
+            if (m_inImport || m_inExport || m_inReinitialize) {
+                m_pendingImports.insert(resolvedPath);
+                return;
+            }
+            if (!contents.error.isEmpty()) {
+                notifyAbout({reference.path, Result::Error, contents.error}, true);
+                return;
+            }
+            const auto state = m_shareStates.value(resolvedPath);
+            if (contents.digest == state.fileDigest && !state.fingerprint.isEmpty()) {
+                return;
+            }
+            QScopedValueRollback importGuard(m_inImport, true);
+            auto fingerprint = state.fingerprint;
+            const auto result = ShareImport::containerInto(contents.data, reference, shareGroup, &fingerprint);
+            rememberFingerprint(resolvedPath, fingerprint, contents.digest);
+            notifyAbout(result, true);
+        });
 }
 
 void ShareObserver::rememberFingerprint(const QString& resolvedPath,
@@ -367,92 +421,127 @@ QSharedPointer<Database> ShareObserver::database()
     return m_db;
 }
 
-QList<ShareObserver::Result> ShareObserver::exportShares()
-{
-    QList<Result> results;
-    struct Reference
-    {
-        KeeShareSettings::Reference config;
-        const Group* group;
-    };
-
-    QMap<QString, QList<Reference>> references;
-    const auto groups = m_db->rootGroup()->groupsRecursive(true);
-    for (const auto* group : groups) {
-        const auto reference = KeeShare::referenceOf(group);
-        if (!reference.isExporting()) {
-            continue;
-        }
-        references[reference.path] << Reference{reference, group};
-    }
-
-    for (auto it = references.cbegin(); it != references.cend(); ++it) {
-        if (it.value().count() != 1) {
-            const auto path = it.value().first().config.path;
-            QStringList groupnames;
-            for (const auto& reference : it.value()) {
-                groupnames << reference.group->name();
-            }
-            results << Result{
-                path, Result::Error, tr("Conflicting export target path %1 in %2").arg(path, groupnames.join(", "))};
-        }
-    }
-    if (!results.isEmpty()) {
-        // We need to block export due to config
-        return results;
-    }
-
-    for (auto it = references.cbegin(); it != references.cend(); ++it) {
-        auto reference = it.value().first();
-        const QString resolvedPath = resolvePath(reference.config.path, m_db);
-        auto watcher = m_fileWatchers.value(resolvedPath);
-        if (watcher) {
-            watcher->stop();
-        }
-
-        // Skip the export if the file already holds the shared content: rewriting it would make
-        // every other database synchronizing with it import and export again, endlessly
-        auto fingerprint = knownFingerprint(resolvedPath);
-        // TODO: save new path into group settings if not saving to signed container anymore
-        const auto result = ShareExport::intoContainer(resolvedPath, reference.config, reference.group, &fingerprint);
-        if (result.isValid()) {
-            rememberFingerprint(resolvedPath, result.isError() ? QByteArray() : fingerprint, fileDigest(resolvedPath));
-            results << result;
-        }
-
-        if (watcher) {
-            watcher->start(resolvedPath, FileWatchPeriod, FileWatchSize);
-        }
-    }
-    return results;
-}
-
 void ShareObserver::handleDatabaseSaved()
 {
-    if (!KeeShare::active().out) {
+    if (!m_enabled || !KeeShare::active().out) {
         return;
     }
-    QStringList error;
-    QStringList warning;
-    QStringList success;
-
-    const auto results = exportShares();
-    for (const Result& result : results) {
-        if (!result.isValid()) {
-            Q_ASSERT(result.isValid());
-            continue;
-        }
-        if (result.isError()) {
-            error << tr("Export to %1 failed (%2)").arg(result.path).arg(result.message);
-        } else if (result.isWarning()) {
-            warning << tr("Export to %1 failed (%2)").arg(result.path).arg(result.message);
-        } else if (result.isInfo()) {
-            success << tr("Export to %1 successful (%2)").arg(result.path).arg(result.message);
-        } else {
-            success << tr("Export to %1").arg(result.path);
+    for (const auto* group : m_db->rootGroup()->groupsRecursive(true)) {
+        const auto reference = KeeShare::referenceOf(group);
+        if (reference.isExporting()) {
+            m_pendingExports.insert(resolvePath(reference.path, m_db));
         }
     }
-    notifyAbout(success, warning, error);
+    processPendingExports();
+}
+
+void ShareObserver::processPendingExports()
+{
+    if (m_inImport || m_inExport || m_inReinitialize || !m_enabled || !KeeShare::active().out) {
+        return;
+    }
+    const auto pending = m_pendingExports;
+    for (const auto& path : pending) {
+        if (!m_busyPaths.contains(path) && !m_pendingImports.contains(path)) {
+            m_pendingExports.remove(path);
+            exportShare(path);
+        }
+    }
+}
+
+void ShareObserver::exportShare(const QString& path)
+{
+    QPointer<Group> group;
+    QStringList groupNames;
+    for (auto* candidate : m_db->rootGroup()->groupsRecursive(true)) {
+        const auto reference = KeeShare::referenceOf(candidate);
+        if (reference.isExporting() && resolvePath(reference.path, m_db) == path) {
+            group = candidate;
+            groupNames << candidate->name();
+        }
+    }
+    if (!group || groupNames.size() != 1) {
+        m_retryExports.remove(path);
+        if (group) {
+            notifyAbout({path, Result::Error,
+                         tr("Conflicting export target path %1 in %2").arg(path, groupNames.join(", "))}, false);
+        }
+        emit exportFinished();
+        return;
+    }
+    const auto reference = KeeShare::referenceOf(group);
+    const auto generation = m_generation;
+    const auto enabled = QSharedPointer<std::atomic_bool>::create(true);
+    m_exportTokens.insert(path, enabled);
+    m_busyPaths.insert(path);
+    AsyncTask::runThenCallback(
+        [path] { return readShareFile(path); },
+        this,
+        [this, path, reference, group, generation, enabled](const FileContents& contents) {
+            if (generation != m_generation) {
+                return;
+            }
+            bool writing = false;
+            auto finished = qScopeGuard([this, path, &writing] {
+                if (!writing) {
+                    m_busyPaths.remove(path);
+                    m_exportTokens.remove(path);
+                    emit exportFinished();
+                }
+                emit importFinished();
+            });
+            if (!enabled->load() || !m_enabled || !KeeShare::active().out || !group
+                || !(KeeShare::referenceOf(group) == reference)) {
+                return;
+            }
+            if (m_inImport || m_inExport || m_inReinitialize) {
+                m_pendingExports.insert(path);
+                return;
+            }
+            QScopedValueRollback exportGuard(m_inExport, true);
+            const auto state = m_shareStates.value(path);
+            auto fingerprint = contents.digest == state.fileDigest ? state.fingerprint : QByteArray();
+            QByteArray data;
+            // Snapshot/serialize on the database thread; the worker never touches live groups or config.
+            const auto result = ShareExport::containerFrom(data, reference, group, &fingerprint);
+            if (!result.isValid()) {
+                m_retryExports.remove(path);
+                return;
+            }
+            if (result.isError()) {
+                notifyAbout(result, false);
+                return;
+            }
+            writing = true;
+            const auto digest = CryptoHash::hash(data, CryptoHash::Sha256);
+            AsyncTask::runThenCallback(
+                [path, data, expectedDigest = contents.digest, enabled] {
+                    return writeShareFile(path, data, expectedDigest, enabled);
+                },
+                this,
+                [this, path, reference, group, generation, fingerprint, digest, enabled](const QString& error) {
+                    if (generation != m_generation) {
+                        return;
+                    }
+                    auto finished = qScopeGuard([this, path] {
+                        m_busyPaths.remove(path);
+                        m_exportTokens.remove(path);
+                        emit exportFinished();
+                        emit importFinished();
+                    });
+                    if (!enabled->load() || !group || !(KeeShare::referenceOf(group) == reference)) {
+                        return;
+                    }
+                    if (!error.isEmpty()) {
+                        m_retryExports.insert(path);
+                        notifyAbout({reference.path, Result::Error, error}, false);
+                    } else {
+                        m_retryExports.remove(path);
+                        rememberFingerprint(path, fingerprint, digest);
+                        notifyAbout({reference.path}, false);
+                    }
+                });
+        });
 }
 
 ShareObserver::Result::Result(const QString& path, ShareObserver::Result::Type type, const QString& message)
