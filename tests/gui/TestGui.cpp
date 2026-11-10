@@ -394,6 +394,59 @@ void TestGui::testMergeDatabase()
     QCOMPARE(m_db->rootGroup()->findChildByName("General")->entries().size(), 1);
 }
 
+void TestGui::testMergeIntoDatabase()
+{
+    // Copy the database to merge into, so that the test data remains untouched
+    TemporaryFile targetFile;
+    QVERIFY(targetFile.copyFromFile(QString(KEEPASSX_TEST_DATA_DIR).append("/MergeDatabase.kdbx")));
+    const auto tabCount = m_tabWidget->count();
+
+    // It is safe to ignore the warning this line produces
+    QSignalSpy dbMergeSpy(m_dbWidget.data(), SIGNAL(databaseMerged(QSharedPointer<Database>)));
+    QApplication::processEvents();
+
+    // Set file to merge into
+    fileDialog()->setNextFileName(targetFile.fileName());
+    triggerAction("actionDatabaseMergeInto");
+
+    QWidget* editPasswordMerge;
+    QTRY_VERIFY((editPasswordMerge = QApplication::focusWidget()) && editPasswordMerge->objectName() == "passwordEdit");
+    QVERIFY(editPasswordMerge->isVisible());
+
+    QTest::keyClicks(editPasswordMerge, "a");
+    QTest::keyClick(editPasswordMerge, Qt::Key_Enter);
+
+    // Confirm merge in confirmation dialog
+    QWidget* mergeDialog = nullptr;
+    QTRY_VERIFY([&mergeDialog]() {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            if (widget && widget->objectName() == "MergeDialog" && widget->isVisible()) {
+                mergeDialog = widget;
+            }
+        }
+        return mergeDialog != nullptr;
+    }());
+    QTest::keyClick(mergeDialog, Qt::Key_Enter);
+
+    QTRY_COMPARE(dbMergeSpy.count(), 1);
+
+    // The target database was opened in the background only, the current database is unchanged
+    QCOMPARE(m_tabWidget->count(), tabCount);
+    QCOMPARE(m_tabWidget->currentDatabaseWidget(), m_dbWidget.data());
+    QVERIFY(!m_tabWidget->tabText(m_tabWidget->currentIndex()).contains("*"));
+    QVERIFY(!m_db->isModified());
+
+    // The target database file contains all entries of the current database
+    auto key = QSharedPointer<CompositeKey>::create();
+    key->addKey(QSharedPointer<PasswordKey>::create("a"));
+    auto targetDb = QSharedPointer<Database>::create();
+    QVERIFY(targetDb->open(targetFile.fileName(), key, nullptr));
+    for (const auto* entry : m_db->rootGroup()->entriesRecursive()) {
+        QVERIFY2(targetDb->rootGroup()->findEntryByUuid(entry->uuid()),
+                 qPrintable(QString("Entry missing in target: %1").arg(entry->title())));
+    }
+}
+
 void TestGui::prepareAndTriggerRemoteSync()
 {
     // create remote settings in settings dialog

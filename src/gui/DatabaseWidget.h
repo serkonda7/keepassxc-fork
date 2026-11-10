@@ -177,6 +177,7 @@ signals:
 public slots:
     bool lock();
     bool save();
+    void mergeIntoDatabase(const QSharedPointer<Database>& targetDb, bool saveTarget);
     bool saveAs();
     bool saveBackup();
 
@@ -286,6 +287,7 @@ private slots:
     void loadDatabase(bool accepted);
     void unlockDatabase(bool accepted);
     void mergeDatabase(bool accepted);
+    void mergeIntoUnlockedDatabase(bool accepted);
     void syncUnlockedDatabase(bool accepted);
     bool syncWithDatabase(const QSharedPointer<Database>& otherDb, QString& error);
     void uploadAndFinishSync(const RemoteParams* params, RemoteHandler::RemoteResult result);
@@ -302,6 +304,8 @@ private:
     void openDatabaseFromEntry(const Entry* entry, bool inBackground = true);
     void performIconDownloads(const QList<Entry*>& entries, bool force = false, bool downloadInBackground = false);
     bool performSave(QString& errorMessage, const QString& fileName = {});
+    bool
+    saveDatabaseWithSettings(const QSharedPointer<Database>& db, QString& errorMessage, const QString& fileName = {});
 
     QSharedPointer<Database> m_db;
 

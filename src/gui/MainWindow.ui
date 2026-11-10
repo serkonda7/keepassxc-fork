@@ -239,6 +239,13 @@
      <addaction name="actionExportHtml"/>
      <addaction name="actionExportXML"/>
     </widget>
+    <widget class="QMenu" name="menuMerge">
+     <property name="title">
+      <string>&amp;Merge</string>
+     </property>
+     <addaction name="actionDatabaseMergeInto"/>
+     <addaction name="actionDatabaseMerge"/>
+    </widget>
     <widget class="QMenu" name="menuRemoteSync">
      <property name="title">
       <string>Remote S&amp;ync…</string>
@@ -263,7 +270,7 @@
     <addaction name="actionPasskeys"/>
     <addaction name="actionImportPasskey"/>
     <addaction name="separator"/>
-    <addaction name="actionDatabaseMerge"/>
+    <addaction name="menuMerge"/>
     <addaction name="menuRemoteSync"/>
     <addaction name="actionImport"/>
     <addaction name="menuExport"/>
@@ -519,9 +526,17 @@
     <string notr="true">Ctrl+Shift+N</string>
    </property>
   </action>
+  <action name="actionDatabaseMergeInto">
+   <property name="text">
+    <string>&amp;Into Database…</string>
+   </property>
+   <property name="toolTip">
+    <string>Merge Into Database</string>
+   </property>
+  </action>
   <action name="actionDatabaseMerge">
    <property name="text">
-    <string>&amp;Merge From Database…</string>
+    <string>&amp;From Database…</string>
    </property>
    <property name="toolTip">
     <string>Merge From Database</string>

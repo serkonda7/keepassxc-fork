@@ -40,6 +40,7 @@ public:
     explicit DatabaseTabWidget(QWidget* parent = nullptr);
     ~DatabaseTabWidget() override;
     void mergeDatabase(const QString& filePath);
+    void mergeIntoDatabase(const QString& filePath);
 
     QString tabName(int index);
     DatabaseWidget* currentDatabaseWidget();
@@ -66,6 +67,7 @@ public slots:
     DatabaseWidget* newDatabase();
     void openDatabase();
     void mergeDatabase();
+    void mergeIntoDatabase();
     void importFile();
     bool saveDatabase(int index = -1);
     bool saveDatabaseAs(int index = -1);

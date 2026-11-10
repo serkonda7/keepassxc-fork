@@ -1413,6 +1413,99 @@ void DatabaseWidget::mergeDatabase(bool accepted)
     }
 }
 
+/**
+ * Merge the current database into a database that was unlocked in the unlock dialog
+ * (see DatabaseOpenDialog::Intent::MergeInto). The target database is not opened in a tab,
+ * it is saved to its file after a successful merge and discarded afterwards.
+ *
+ * @param accepted true if the unlock dialog was confirmed with OK
+ */
+void DatabaseWidget::mergeIntoUnlockedDatabase(bool accepted)
+{
+    if (!accepted) {
+        return;
+    }
+
+    auto* senderDialog = qobject_cast<DatabaseOpenDialog*>(sender());
+    Q_ASSERT(senderDialog);
+    if (!senderDialog) {
+        return;
+    }
+
+    auto targetDb = senderDialog->database();
+    if (!targetDb) {
+        showMessage(tr("No target database, nothing to do."), MessageWidget::Error);
+        return;
+    }
+
+    mergeIntoDatabase(targetDb, true);
+}
+
+/**
+ * Merge the current database into another database.
+ * This reuses the regular merge logic with the current database acting as the merge source.
+ *
+ * @param targetDb database to merge the current database into
+ * @param saveTarget save the target database to its file after a successful merge
+ *                   (used when the target database is opened in the background)
+ */
+void DatabaseWidget::mergeIntoDatabase(const QSharedPointer<Database>& targetDb, bool saveTarget)
+{
+    if (!m_db) {
+        showMessage(tr("No current database."), MessageWidget::Error);
+        return;
+    }
+    if (!targetDb) {
+        showMessage(tr("No target database, nothing to do."), MessageWidget::Error);
+        return;
+    }
+    if (targetDb == m_db) {
+        showMessage(tr("Cannot merge a database into itself."), MessageWidget::Error);
+        return;
+    }
+
+#ifdef WITH_XC_KEESHARE
+    // Disable KeeShare while merging to avoid conflicts with incoming changes
+    KeeShare::instance()->setSharingEnabled(targetDb, false);
+#endif
+
+    auto* mergeDialog = new MergeDialog(m_db, targetDb, this);
+    connect(mergeDialog, &MergeDialog::databaseMerged, this, [this, targetDb, saveTarget](bool changed) {
+        if (!changed) {
+            showMessage(tr("No changes were made by the merge operation."), MessageWidget::Information);
+            return;
+        }
+
+        const auto targetName = QFileInfo(targetDb->filePath()).fileName();
+        if (saveTarget) {
+            QString errorMessage;
+            if (!saveDatabaseWithSettings(targetDb, errorMessage)) {
+                showMessage(tr("Writing the target database %1 failed: %2").arg(targetName, errorMessage),
+                            MessageWidget::Error,
+                            true,
+                            MessageWidget::LongAutoHideTimeout);
+                return;
+            }
+            showMessage(tr("Successfully merged into the database %1.").arg(targetName), MessageWidget::Positive);
+        } else {
+            showMessage(tr("Successfully merged into the database %1. Save it to keep the changes.").arg(targetName),
+                        MessageWidget::Positive);
+        }
+        emit databaseMerged(targetDb);
+    });
+    connect(mergeDialog, &MergeDialog::finished, this, [this, targetDb](int result) {
+        if (result == QDialog::Rejected) {
+            showMessage(tr("Merge canceled, no changes were made."), MessageWidget::Information);
+        }
+#ifdef WITH_XC_KEESHARE
+        KeeShare::instance()->setSharingEnabled(targetDb, true);
+#else
+        Q_UNUSED(targetDb);
+#endif
+    });
+    mergeDialog->open();
+}
+
 void DatabaseWidget::syncUnlockedDatabase(bool accepted)
 {
     if (accepted) {
@@ -1491,6 +1584,9 @@ void DatabaseWidget::unlockDatabase(bool accepted)
     if (senderDialog) {
         if (senderDialog->intent() == DatabaseOpenDialog::Intent::Merge) {
             mergeDatabase(accepted);
+            return;
+        } else if (senderDialog->intent() == DatabaseOpenDialog::Intent::MergeInto) {
+            mergeIntoUnlockedDatabase(accepted);
             return;
         } else if (senderDialog->intent() == DatabaseOpenDialog::Intent::RemoteSync) {
             syncUnlockedDatabase(accepted);
@@ -2585,6 +2681,21 @@ bool DatabaseWidget::saveAs()
 
 bool DatabaseWidget::performSave(QString& errorMessage, const QString& fileName)
 {
+    return saveDatabaseWithSettings(m_db, errorMessage, fileName);
+}
+
+/**
+ * Save the given database honoring the configured save method and backup settings.
+ *
+ * @param db database to save
+ * @param errorMessage receives the error message on failure
+ * @param fileName optional, save the database under this file name instead of its current one
+ * @return true on success
+ */
+bool DatabaseWidget::saveDatabaseWithSettings(const QSharedPointer<Database>& db,
+                                              QString& errorMessage,
+                                              const QString& fileName)
+{
     QPointer<QWidget> focusWidget(qApp->focusWidget());
 
     // Lock out interactions
@@ -2611,7 +2722,7 @@ bool DatabaseWidget::performSave(QString& errorMessage, const QString& fileName)
             backupFilePath = config()->getDefault(Config::BackupFilePathPattern).toString();
         }
 
-        QFileInfo dbFileInfo(m_db->filePath());
+        QFileInfo dbFileInfo(db->filePath());
         backupFilePath = Tools::substituteBackupFilePath(backupFilePath, dbFileInfo.canonicalFilePath());
         if (!backupFilePath.isNull()) {
             // Note that we cannot guarantee that backupFilePath is actually a valid filename. QT currently provides
@@ -2625,9 +2736,9 @@ bool DatabaseWidget::performSave(QString& errorMessage, const QString& fileName)
 
     bool ok;
     if (fileName.isEmpty()) {
-        ok = m_db->save(saveAction, backupFilePath, &errorMessage);
+        ok = db->save(saveAction, backupFilePath, &errorMessage);
     } else {
-        ok = m_db->saveAs(fileName, saveAction, backupFilePath, &errorMessage);
+        ok = db->saveAs(fileName, saveAction, backupFilePath, &errorMessage);
     }
 
     // Return control
