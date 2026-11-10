@@ -40,6 +40,7 @@ public:
         None,
         AutoType,
         Merge,
+        MergeInto,
         RemoteSync,
         Browser
     };

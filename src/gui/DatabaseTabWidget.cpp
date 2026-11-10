@@ -340,6 +340,66 @@ void DatabaseTabWidget::mergeDatabase(const QString& filePath)
 }
 
 /**
+ * Merge the current database into another database file selected by the user.
+ */
+void DatabaseTabWidget::mergeIntoDatabase()
+{
+    auto dbWidget = currentDatabaseWidget();
+    if (dbWidget && !dbWidget->isLocked()) {
+        auto filter = QString("%1 (*.kdbx);;%2 (*)").arg(tr("KeePass 2 Database"), tr("All files"));
+        auto fileName = fileDialog()->getOpenFileName(
+            this, tr("Merge into database"), FileDialog::getLastDir("merge"), filter);
+        if (!fileName.isEmpty()) {
+            FileDialog::saveLastDir("merge", fileName, true);
+            mergeIntoDatabase(fileName);
+        }
+    }
+}
+
+/**
+ * Merge the current database into the database at the given path.
+ *
+ * The target database is unlocked in the unlock dialog and kept in the background (no tab is opened).
+ * The regular merge logic is then performed with the current database as source and the target database
+ * is saved afterwards. If the target database is already open and unlocked in another tab, the merge is
+ * performed into that database instead and it is left to the user to save it.
+ *
+ * @param filePath path of the database to merge the current database into
+ */
+void DatabaseTabWidget::mergeIntoDatabase(const QString& filePath)
+{
+    auto* dbWidget = currentDatabaseWidget();
+    if (!dbWidget || dbWidget->isLocked()) {
+        return;
+    }
+
+    QString cleanFilePath = QDir::toNativeSeparators(filePath);
+    QString canonicalFilePath = QFileInfo(cleanFilePath).canonicalFilePath();
+    if (canonicalFilePath.isEmpty()) {
+        emit messageGlobal(tr("Failed to open %1. It either does not exist or is not accessible.").arg(cleanFilePath),
+                           MessageWidget::Error);
+        return;
+    }
+
+    if (dbWidget->database()->canonicalFilePath().compare(canonicalFilePath, FILE_CASE_SENSITIVE) == 0) {
+        dbWidget->showMessage(tr("Cannot merge a database into itself."), MessageWidget::Error);
+        return;
+    }
+
+    // Reuse an already unlocked database tab of the target file to avoid conflicting writes
+    for (int i = 0, c = count(); i < c; ++i) {
+        auto* otherWidget = databaseWidgetFromIndex(i);
+        if (otherWidget && otherWidget != dbWidget && !otherWidget->isLocked()
+            && otherWidget->database()->canonicalFilePath().compare(canonicalFilePath, FILE_CASE_SENSITIVE) == 0) {
+            dbWidget->mergeIntoDatabase(otherWidget->database(), false);
+            return;
+        }
+    }
+
+    unlockDatabaseInDialog(dbWidget, DatabaseOpenDialog::Intent::MergeInto, cleanFilePath);
+}
+
+/**
  * Attempt to close the current database and remove its tab afterwards.
  *
  * @param index index of the database tab to close
@@ -838,7 +898,8 @@ void DatabaseTabWidget::handleDatabaseUnlockDialogFinished(bool accepted, Databa
 {
     // change the active tab to the database that was just unlocked in the dialog
     auto intent = m_databaseOpenDialog->intent();
-    if (accepted && intent != DatabaseOpenDialog::Intent::Merge && intent != DatabaseOpenDialog::Intent::RemoteSync) {
+    if (accepted && intent != DatabaseOpenDialog::Intent::Merge && intent != DatabaseOpenDialog::Intent::MergeInto
+        && intent != DatabaseOpenDialog::Intent::RemoteSync) {
         int index = indexOf(dbWidget);
         if (index != -1) {
             setCurrentIndex(index);
